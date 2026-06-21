@@ -12,30 +12,68 @@
 
 ## 快速开始
 
-```bash
-# 安装依赖
-pip install -r requirements.txt
+### 前提条件
 
-# 测试：爬取单个版块（2026 支教队，约几十帖）
+| 条件 | 说明 |
+|------|------|
+| **Python** | 3.8 或更高版本 |
+| **操作系统** | Windows / Linux / macOS 均可 |
+| **网络** | 能访问 https://bbs.casdu.cn |
+| **磁盘空间** | 全量爬取约需 200 MB（JSONL + SQLite） |
+| **登录** | 不需要 — 全部版块匿名可访问 |
+
+### 安装
+
+```bash
+# 1. 下载项目（git clone 或直接下载 ZIP 解压）
+git clone <repo-url> casdu-crawl
+cd casdu-crawl
+
+# 2. 安装依赖（仅需 requests）
+pip install -r requirements.txt
+```
+
+项目仅依赖 `requests`，无需 beautifulsoup4、lxml 等重型库 — archiver 页是纯 HTML，正则表达式完全胜任。
+
+### 运行
+
+```bash
+# 快速验证：Demo 抽样爬取（2~3 分钟，产出约 80 主题 1000 条记录）
+python scripts/run_demo.py
+
+# 单版块测试（如 2026 支教队版块，几十帖，十几秒完成）
 python scripts/run_scraper.py --full --fid 152
 
 # 全量爬取（38 个版块，约 14,690+ 帖，预计 1.2 小时）
 python scripts/run_scraper.py --full
 
-# 全量 + 互动元数据（耗时增加）
+# 全量 + 互动元数据（耗时约 2.5 小时）
 python scripts/run_scraper.py --full --with-meta
 ```
 
-也可用模块方式运行：
+模块方式运行同样有效：
+
 ```bash
 python -m casdu_crawl.scraper --full
 ```
 
-无需 beautifulsoup4 — archiver 页面结构简单，正则表达式完全胜任。
+### 运行后产物
+
+```
+data/
+├── demo/
+│   ├── threads.jsonl    # Demo 抽样输出
+│   └── summary.json     # 抽样报告
+├── threads.jsonl        # 正式爬取输出（所有楼层）
+├── index.db             # SQLite 索引（含 FTS5）
+└── checkpoint.json      # 断点记录（崩溃后可续传）
+```
 
 ---
 
 ## 命令参考
+
+### 爬虫脚本（`scripts/run_scraper.py`）
 
 | 命令 | 说明 |
 |------|------|
@@ -46,6 +84,25 @@ python -m casdu_crawl.scraper --full
 | `python scripts/run_scraper.py --incremental` | 增量更新（仅爬上次之后的新帖和新回复） |
 | `python scripts/run_scraper.py --incremental --with-meta` | 增量更新 + 互动元数据 |
 | `python scripts/run_scraper.py --info` | 查看当前状态（上次爬取时间、已归档数等） |
+
+### Demo 抽样脚本（`scripts/run_demo.py`）
+
+| 命令 | 说明 |
+|------|------|
+| `python scripts/run_demo.py` | 默认：每版块随机 3 帖 + 全部置顶帖 |
+| `python scripts/run_demo.py --samples 5` | 每版块随机 5 帖 |
+| `python scripts/run_demo.py --fid 2` | 只抽指定版块 |
+| `python scripts/run_demo.py --seed 123` | 换随机种子（默认 42，可复现） |
+
+> **Demo 抽样策略**：扫描全部 38 个版块首页，通过跨版块出现频率自动识别全局置顶帖（同一 tid 出现在 ≥3 个版块），置顶帖全部收录；每个版块再从普通帖中随机抽取指定数量。输出 `data/demo/threads.jsonl`（与主爬虫同构）和 `data/demo/summary.json`（抽样报告）。
+
+### 格式转换脚本（`scripts/run_convert.py`）
+
+| 命令 | 说明 |
+|------|------|
+| `python scripts/run_convert.py` | 默认：`data/threads.jsonl` → `data/casdu_meta.jsonl` |
+| `python scripts/run_convert.py --input other.jsonl` | 指定输入文件 |
+| `python scripts/run_convert.py --max-chars 1500 --overlap 200` | 调整分块参数 |
 
 ---
 
@@ -61,12 +118,12 @@ set CASDU_USER=你的用户名
 set CASDU_PASS=你的密码
 
 # Windows (PowerShell)
-$env:CASDU_USER="你的用户名"
-$env:CASDU_PASS="你的密码"
+$env:CASDU_USER=”你的用户名”
+$env:CASDU_PASS=”你的密码”
 
 # Linux / macOS
-export CASDU_USER="你的用户名"
-export CASDU_PASS="你的密码"
+export CASDU_USER=”你的用户名”
+export CASDU_PASS=”你的密码”
 ```
 
 **安全说明**：用户名和密码仅从环境变量读取，不硬编码在代码中，不写入日志。当前 Discuz! X3.2 的登录需要 formhash CSRF token，自动登录暂不可用（会降级为匿名模式继续运行）。
@@ -95,42 +152,46 @@ User-Agent 声明为归档用途：`casdu-archiver/1.0 (bbs.casdu.cn; data prese
 
 ```
 data/
-├── threads.jsonl       # 所有楼层，每行一条 JSON
-├── index.db            # SQLite，含 threads / posts / fts_posts 三表
-└── checkpoint.json     # 断点记录，支持崩溃后续传
+├── demo/
+│   ├── threads.jsonl    # Demo 抽样（与正式格式一致）
+│   └── summary.json     # 抽样报告
+├── threads.jsonl        # 所有楼层，每行一条 JSON
+├── index.db             # SQLite，含 threads / posts / fts_posts 三表
+├── checkpoint.json      # 断点记录，支持崩溃后续传
+└── casdu_meta.jsonl     # 格式转换输出（运行 run_convert.py 后生成）
 ```
 
 ### threads.jsonl 单条记录（示例数据为虚构）
 
 ```json
 {
-  "tid": 8932, "fid": 6,
-  "board": "关于单车", "category": "技术·装备",
-  "title": "【技术部】2025秋自行车检车标准及流程",
-  "author": "骑车看海", "floor": 3,
-  "page": 1, "position": 3,
-  "post_time": "2025-10-12 15:04:38",
-  "content": "三、变速系统检查\n\n1. 前拨定位：将链条挂至大盘大飞…",
-  "url": "https://bbs.casdu.cn/forum.php?mod=viewthread&tid=8932",
-  "sticky": 0,
-  "tags": ["技术", "检车", "2025秋", "规程"],
-  "year": "2025", "season": "秋",
-  "event_type": "通知", "activity_type": "",
-  "routes": [], "roles": ["技术员", "队长"], "problems": [],
-  "meta": {
-    "rating_count": 3,
-    "rating_coins": 35,
-    "rating_details": [
-      {"uid": 2148, "username": "山风", "coins": 15, "reason": "很详细，收藏了"},
-      {"uid": 3507, "username": "追风少年", "coins": 10, "reason": "感谢分享"},
-      {"uid": 1182, "username": "骑行侠", "coins": 10, "reason": "赞一个!"}
+  “tid”: 8932, “fid”: 6,
+  “board”: “关于单车”, “category”: “技术·装备”,
+  “title”: “【技术部】2025秋自行车检车标准及流程”,
+  “author”: “骑车看海”, “floor”: 3,
+  “page”: 1, “position”: 3,
+  “post_time”: “2025-10-12 15:04:38”,
+  “content”: “三、变速系统检查\n\n1. 前拨定位：将链条挂至大盘大飞…”,
+  “url”: “https://bbs.casdu.cn/forum.php?mod=viewthread&tid=8932”,
+  “sticky”: 0,
+  “tags”: [“技术”, “检车”, “2025秋”, “规程”],
+  “year”: “2025”, “season”: “秋”,
+  “event_type”: “通知”, “activity_type”: “”,
+  “routes”: [], “roles”: [“技术员”, “队长”], “problems”: [],
+  “meta”: {
+    “rating_count”: 3,
+    “rating_coins”: 35,
+    “rating_details”: [
+      {“uid”: 2148, “username”: “山风”, “coins”: 15, “reason”: “很详细，收藏了”},
+      {“uid”: 3507, “username”: “追风少年”, “coins”: 10, “reason”: “感谢分享”},
+      {“uid”: 1182, “username”: “骑行侠”, “coins”: 10, “reason”: “赞一个!”}
     ],
-    "recommend_add": 5, "recommend_subtract": 0,
-    "favorite_count": 12,
-    "comment_count": 2,
-    "comments": [
-      {"uid": 3507, "username": "追风少年", "content": "碟刹间隙那段能再详细点吗"},
-      {"uid": 2148, "username": "山风", "content": "已收藏，寒假回家自己调车用"}
+    “recommend_add”: 5, “recommend_subtract”: 0,
+    “favorite_count”: 12,
+    “comment_count”: 2,
+    “comments”: [
+      {“uid”: 3507, “username”: “追风少年”, “content”: “碟刹间隙那段能再详细点吗”},
+      {“uid”: 2148, “username”: “山风”, “content”: “已收藏，寒假回家自己调车用”}
     ]
   }
 }
@@ -145,7 +206,7 @@ data/
 | `tid` | int | 系统 | 帖子 ID，Discuz! 自增主键 |
 | `fid` | int | 系统 | 版块 ID（38 个版块各有编号） |
 | `board` | str | 系统 | 版块名称 |
-| `category` | str | 脚本 | 版块分类（如"技术·装备""远征·2025"） |
+| `category` | str | 脚本 | 版块分类（如”技术·装备””远征·2025”） |
 | `title` | str | 页面 | 帖子标题 |
 | `author` | str | 页面 | 论坛用户名（非真实姓名） |
 | `floor` | int | 页面 | 楼层号 |
@@ -160,9 +221,9 @@ data/
 | `season` | str | 脚本 | 学期，春/秋/暑/寒 |
 | `event_type` | str | 脚本 | 事件类型：通知/总结/报名/探路/选拔… |
 | `activity_type` | str | 脚本 | 活动类型：拉练/远征/体训/比赛… |
-| `routes` | list | 脚本 | 路线名，词典匹配（如 `["怪坡","药乡"]`） |
-| `roles` | list | 脚本 | 职务，词典匹配（如 `["队长","队医"]`） |
-| `problems` | list | 脚本 | 问题类型，词典匹配（如 `["扎胎","摔车"]`） |
+| `routes` | list | 脚本 | 路线名，词典匹配（如 `[“怪坡”,”药乡”]`） |
+| `roles` | list | 脚本 | 职务，词典匹配（如 `[“队长”,”队医”]`） |
+| `problems` | list | 脚本 | 问题类型，词典匹配（如 `[“扎胎”,”摔车”]`） |
 | `meta` | dict | 主站 | **仅在指定 `--with-meta` 时出现**，见下表 |
 
 ### meta 子字段（仅 `--with-meta`）
@@ -178,12 +239,13 @@ data/
 | `comment_count` | int | 点评（楼中楼）条数 |
 | `comments` | list | 每条点评 `{uid, username, content}` |
 
-**总结**：
+**爬取范围总结**：
 
 | 命令 | 爬取范围 |
 |------|---------|
-| `python scraper.py --full` | 以上**除 `meta` 外**的全部字段（tid 到 problems） |
-| `python scraper.py --full --with-meta` | 以上**全部**字段（含 `meta` 互动数据） |
+| `python scripts/run_scraper.py --full` | 以上**除 `meta` 外**的全部字段（tid 到 problems） |
+| `python scripts/run_scraper.py --full --with-meta` | 以上**全部**字段（含 `meta` 互动数据） |
+| `python scripts/run_demo.py` | 同上（抽样子集，格式完全一致） |
 
 不加 `--with-meta` 时爬虫仅使用 archiver 入口（轻量、快速）。加了之后每条帖子额外请求一次主站 `forum.php` 页面提取评分/支持反对/收藏/点评数据，全量耗时约从 1.2 小时增至 2.5 小时。
 
@@ -209,31 +271,39 @@ data/
 ## 项目结构
 
 ```
-D:\ziYuan\github\casdu\
-├── scraper.py                # 主控：全量 + 增量 + --with-meta
-├── config.py                 # 38 版块字典 + 7 类标签词表 + 速率常量
-├── utils.py                  # HTTP、GBK 解码、archiver 解析、主站元数据提取
-├── classifier.py             # 自动分类标签引擎
-├── storage.py                # JSONL 写入 + SQLite（FTS5）+ Checkpoint
-├── convert_for_retrieval.py  # 格式转换：JSONL → faiss_meta.jsonl
-├── PLAN.md                   # 实现计划 + 调试记录
-├── README.md                 # 本文件
-└── data/                     # 爬取产出（运行后生成）
+casdu-crawl/
+├── casdu_crawl/
+│   ├── __init__.py              # 包入口
+│   ├── config.py                # 配置：38 版块字典 + 7 类标签词表 + 速率常量
+│   ├── scraper.py               # 主控：全量 + 增量爬取流程
+│   ├── utils.py                 # HTTP、GBK 解码、archiver 解析、元数据提取
+│   ├── classifier.py            # 自动分类标签引擎
+│   ├── storage.py               # JSONL 写入 + SQLite（FTS5）+ Checkpoint
+│   └── convert_for_retrieval.py # 格式转换：JSONL → faiss_meta.jsonl
+├── scripts/
+│   ├── run_scraper.py           # 爬虫 CLI 入口
+│   ├── run_demo.py              # Demo 抽样 CLI 入口
+│   └── run_convert.py           # 格式转换 CLI 入口
+├── docs/
+│   └── CODE-GENERATE-PLAN.md    # 实现计划 + 调试记录
+├── data/                        # 爬取产出（运行后生成）
+├── requirements.txt
+└── README.md
 ```
 
 ---
 
 ## 后续：构建检索索引
 
-爬取的 JSONL 数据可进一步构建为语义检索引擎，实现"用自然语言搜索论坛历史帖"的效果。
+爬取的 JSONL 数据可进一步构建为语义检索引擎，实现”用自然语言搜索论坛历史帖”的效果。
 
 ### 检索架构
 
 ```
 threads.jsonl
     │
-    ├─→ FAISS 向量索引     ←  embedding 模型编码正文，支持“远征黄巢那年摔车多吗”这类模糊查询
-    ├─→ BM25 关键词索引    ←  jieba 分词后建倒排索引，支持“黄巢 扎胎”精确命中
+    ├─→ FAISS 向量索引     ←  embedding 模型编码正文，支持”远征黄巢那年摔车多吗”这类模糊查询
+    ├─→ BM25 关键词索引    ←  jieba 分词后建倒排索引，支持”黄巢 扎胎”精确命中
     └─→ FTS5 全文索引      ←  SQLite 内置，支持 LIKE 和 MATCH 语法
 ```
 
