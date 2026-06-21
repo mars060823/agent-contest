@@ -118,13 +118,19 @@ def collect_board_threads(session, fid_filter: int = 0):
                 logger.warning("  → 第%d页获取失败: %s", page, e)
                 continue
 
+            # 先解析当前页线程（无论第几页都要解析）
+            threads = parse_board_page(html)
+            all_threads.extend(threads)
+
             if page == 1:
                 max_page = parse_board_max_page(html)
                 if max_page < 2:
-                    break  # 只有一页，不用翻页
-
-            threads = parse_board_page(html)
-            all_threads.extend(threads)
+                    # 只有一页，解析完就退出，不翻第 2 页
+                    for tid, title in threads:
+                        if tid not in tid_fids:
+                            tid_fids[tid] = []
+                        tid_fids[tid].append(fid)
+                    break
 
             for tid, title in threads:
                 if tid not in tid_fids:
