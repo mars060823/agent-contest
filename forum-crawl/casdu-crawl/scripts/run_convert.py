@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-casdu → chexie-knowledge 格式转换 — CLI 入口
+格式转换 — CLI 入口
 等价于 python -m casdu_crawl.convert_for_retrieval
 """
 import sys

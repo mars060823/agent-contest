@@ -130,11 +130,11 @@ BOARD_CATEGORIES = {
     26:  "站务",
 }
 
-# 标签词表（七类，与 chexie 保持一致）
+# 标签词表（七类）
 ROUTES = ["黄巢", "北大赛", "玉符河", "怪坡", "药乡", "斗母泉", "七星台", ...]
 PROBLEMS = ["扎胎", "摔车", "中暑", "抽筋", "掉链", "断辐条", ...]
-ROLES = ["押后", "队医", "队长", "领队", "前站", "前旗", "后旗", ...]
-EVENT_TYPES = ["通知", "总结", "报名", "探路", "选拔", "训练", "比赛", "讨论", "复盘", "公告"]
+ROLES = ["队长", "协理", "前站", "前骑", "前助", "队医", "技术员", "后骑", "摄影", ...]
+EVENT_TYPES = ["通知", "总结", "报名", "探路", "选拔", "训练", "比赛", "讨论", "公告"]
 
 # 速率
 MIN_DELAY = 1.0          # 最小请求间隔（秒）
@@ -204,12 +204,12 @@ POST member.php?mod=logging&action=login&loginsubmit=yes
 七类标签的匹配逻辑：
 
 ```
-1. year + season: 正则 (20\d{2}) + (\d{2}[春秋暑寒冻])
+1. year + season: 正则 (19|20)\d{2} + \d{2}[春秋暑寒]
 2. event_type: 标题含"通知"/"总结"/"报名"/"探路"/"选拔"等
 3. routes: 预置路线词典 → 标题+正文前500字匹配
 4. roles: 预置角色词典 → 全正文匹配
 5. problems: 预置问题词典 → 正文匹配
-6. activity_type: 标题含"拉练"/"远征"/"体训"/"比赛"/"行疆"/"冬游"
+6. activity_type: 标题含"拉练"/"远征"/"体训"/"比赛"/"行疆"/"小队"
 7. tags: 以上所有标签的合并去重
 ```
 
@@ -316,30 +316,9 @@ POST member.php?mod=logging&action=login&loginsubmit=yes
 
 ---
 
-## 与 chexie.net 爬取思路对比
+## 设计来源
 
-代码生成完成后须做对比验证：
-
-| 维度 | **chexie.net** (北大车协) | **bbs.casdu.cn** (山大车协) | 差异原因 |
-|------|--------------------------|----------------------------|---------|
-| **论坛系统** | Discuz!（定制版） | Discuz! X3.2（标准版） | chexie 经过深度定制 |
-| **URL 模式** | `content/index.php?bid=&tid=&p=` | `forum.php?mod=viewthread&tid=` + `archiver/` | chexie 改造了路由 |
-| **版块 ID** | bid (1/2/3/4/7) | fid (2/6/18/24/...) | 两个站点编号体系不同 |
-| **爬取入口** | 直接爬 `content/index.php` 主站 | **archiver/** 纯文本归档 | casdu 用 archiver 更省流量 |
-| **编码** | UTF-8（现代） | **GBK**（遗留） | casdu 站点更老 |
-| **楼层计算** | 直接取 `floor` 字段（爬取时已解析） | `(page-1)*15 + 序号`（archiver 无楼层号） | archiver 不标注楼层 |
-| **数据格式** | 爬取后存为 `threads.json`（数组） | 爬取后存为 `threads.jsonl`（行式JSON） | JSONL 更适合增量追加 |
-| **去重策略** | 按 `(board, tid, floor)` 三元组 | 按 `(fid, tid, page, position)` | 需要等价但独立实现 |
-| **标签体系** | 7 类（routes/problems/roles/years/season/event_type/cues） | **同 7 类**，词表针对山大做适配 | 词表不同（黄巢 vs 白河等） |
-| **登录态** | 无登录（公开可见） | **可选登录**（凭据已提供） | 预留能力 |
-
-**关键共识**：
-- 两个站点都基于 Discuz!，核心 DOM 结构相同（`<div class="author">`, `class="t_f"`, `class="authi"`）
-- chexie-knowledge 的 `normalize_text()` 清洗逻辑、`split_text()` 分块逻辑 可直接复用
-- 标签引擎（classifier）直接参考 `build_entities.py` 的字典匹配 + 正则提取模式
-- 两个数据集的输出格式应保持高度一致，便于后续统一检索
-
----
+标签引擎的字典匹配 + 正则提取模式参考了 chexie-knowledge 的 `build_entities.py`；`normalize_text()` 清洗逻辑和 `split_text()` 分块逻辑也复用自同一项目。
 
 ## 附录：fid=152 首次爬取调试记录
 

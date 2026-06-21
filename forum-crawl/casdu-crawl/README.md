@@ -116,7 +116,7 @@ data/
   "tags": ["技术", "检车", "2025秋", "规程"],
   "year": "2025", "season": "秋",
   "event_type": "通知", "activity_type": "",
-  "routes": [], "roles": ["技术员", "押后"], "problems": [],
+  "routes": [], "roles": ["技术员", "队长"], "problems": [],
   "meta": {
     "rating_count": 3,
     "rating_coins": 35,
@@ -157,11 +157,11 @@ data/
 | `sticky` | int | 脚本 | 置顶标记：0=普通，1=版块置顶，2=全局置顶 |
 | `tags` | list | 脚本 | 全部标签的合并（以下 6 类的并集） |
 | `year` | str | 脚本 | 年份，正则提取自标题（如 `2025`） |
-| `season` | str | 脚本 | 学期，春/秋/暑/寒/冬 |
-| `event_type` | str | 脚本 | 事件类型：通知/总结/报名/探路/复盘… |
+| `season` | str | 脚本 | 学期，春/秋/暑/寒 |
+| `event_type` | str | 脚本 | 事件类型：通知/总结/报名/探路/选拔… |
 | `activity_type` | str | 脚本 | 活动类型：拉练/远征/体训/比赛… |
 | `routes` | list | 脚本 | 路线名，词典匹配（如 `["怪坡","药乡"]`） |
-| `roles` | list | 脚本 | 职务，词典匹配（如 `["押后","队医"]`） |
+| `roles` | list | 脚本 | 职务，词典匹配（如 `["队长","队医"]`） |
 | `problems` | list | 脚本 | 问题类型，词典匹配（如 `["扎胎","摔车"]`） |
 | `meta` | dict | 主站 | **仅在指定 `--with-meta` 时出现**，见下表 |
 
@@ -215,7 +215,7 @@ D:\ziYuan\github\casdu\
 ├── utils.py                  # HTTP、GBK 解码、archiver 解析、主站元数据提取
 ├── classifier.py             # 自动分类标签引擎
 ├── storage.py                # JSONL 写入 + SQLite（FTS5）+ Checkpoint
-├── convert_for_retrieval.py  # 格式转换：casdu JSONL → chexie faiss_meta.jsonl
+├── convert_for_retrieval.py  # 格式转换：JSONL → faiss_meta.jsonl
 ├── PLAN.md                   # 实现计划 + 调试记录
 ├── README.md                 # 本文件
 └── data/                     # 爬取产出（运行后生成）

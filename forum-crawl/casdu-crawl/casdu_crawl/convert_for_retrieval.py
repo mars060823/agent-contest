@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-casdu → chexie-knowledge 格式转换脚本
+格式转换脚本
 
-将 casdu scraper 输出的 threads.jsonl 转换为 chexie-knowledge 检索管线
-可直用的 faiss_meta.jsonl 同构格式。
+将 scraper 输出的 threads.jsonl 转换为检索管线可用的 faiss_meta.jsonl 同构格式。
 
 用法：
     python convert_for_retrieval.py                     # 默认输入 data/threads.jsonl
@@ -11,7 +10,7 @@ casdu → chexie-knowledge 格式转换脚本
     python convert_for_retrieval.py --max-chars 1500 --overlap 200
 
 输出：
-    data/casdu_meta.jsonl    → 可直接喂给 build_chexie_faiss.py 的输入
+    data/casdu_meta.jsonl    → 可直接喂给 embedding 管线
 """
 
 import argparse
@@ -27,8 +26,25 @@ from casdu_crawl.config import PROJECT_ROOT
 DATA_DIR = PROJECT_ROOT / "data"
 
 
+def _safe_dumps(obj) -> str:
+    """json.dumps 的安全封装，自动清理 GBK lone surrogate。"""
+    data = _sanitize(obj)
+    return json.dumps(data, ensure_ascii=False)
+
+
+def _sanitize(obj):
+    """递归清理字符串中的 lone surrogate 字符。"""
+    if isinstance(obj, str):
+        return obj.encode("utf-8", errors="replace").decode("utf-8")
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize(v) for v in obj]
+    return obj
+
+
 # ============================================================================
-# 文本清洗 + 分块（直接复用 chexie build_chexie_faiss.py 逻辑）
+# 文本清洗 + 分块
 # ============================================================================
 
 def normalize_text(text: str) -> str:
@@ -40,10 +56,7 @@ def normalize_text(text: str) -> str:
 
 
 def split_text(text: str, max_chars: int = 1500, overlap: int = 200) -> list[str]:
-    """语义感知分块：在句末标点处切分，贪婪打包到 max_chars。
-
-    与 chexie build_chexie_faiss.py 的 split_text() 完全一致。
-    """
+    """语义感知分块：在句末标点处切分，贪婪打包到 max_chars。"""
     if len(text) <= max_chars:
         return [text]
 
@@ -97,14 +110,11 @@ def split_text(text: str, max_chars: int = 1500, overlap: int = 200) -> list[str
 
 
 # ============================================================================
-# cues + source_label（复用 chexie 语义分析逻辑）
+# cues + source_label — 语义线索分析
 # ============================================================================
 
 def cues(title: str, text: str) -> str:
-    """分析帖子中蕴含的语义线索。
-
-    与 chexie build_chexie_faiss.py 的 cues() 完全一致。
-    """
+    """分析帖子中蕴含的语义线索。"""
     haystack = f"{title}\n{text}"
     mapping = {
         "proposal": ["建议", "提议", "提案", "方案", "是否", "拟"],
@@ -118,10 +128,7 @@ def cues(title: str, text: str) -> str:
 
 
 def source_label(title: str, text: str) -> str:
-    """检测是否为执委会/理事会/财务管理类帖子。
-
-    chexie 版检测北大车协执委会模式，此处适配山大车协上下文。
-    """
+    """检测是否为执委会/理事会/财务管理类帖子。"""
     haystack = f"{title}\n{text[:800]}"
     patterns = [
         r"第[一二三四五六七八九十百零〇0-9]+次[^，。\n]{0,12}执委会",
@@ -145,15 +152,15 @@ def source_label(title: str, text: str) -> str:
 # ============================================================================
 
 def convert_record(record: dict, max_chars: int, overlap: int) -> list[dict]:
-    """将一条 casdu post 记录转换为一条或多条 chexie 格式记录。
+    """将一条 post 记录转换为一条或多条检索格式记录。
 
     Args:
-        record:  casdu threads.jsonl 的单行 JSON
+        record:  threads.jsonl 的单行 JSON
         max_chars: 分块最大字符数
         overlap:   分块重叠字符数
 
     Returns:
-        [{text, source, id}, ...]  — chexie faiss_meta.jsonl 同构格式
+        [{text, source, id}, ...]  — faiss_meta.jsonl 同构格式
     """
     fid = record.get("fid", 0)
     tid = record.get("tid", 0)
@@ -198,7 +205,7 @@ def convert_record(record: dict, max_chars: int, overlap: int) -> list[dict]:
         results.append({
             "text": doc,
             "source": {
-                "fid": fid,                    # casdu 用 fid（chexie 用 bid）
+                "fid": fid,                    # 版块 ID
                 "board": board,
                 "tid": tid,
                 "title": title,
@@ -210,7 +217,7 @@ def convert_record(record: dict, max_chars: int, overlap: int) -> list[dict]:
                 "url": url,
                 "source_label": label,
                 "cues": cue_str,
-                # casdu 额外标签字段（chexie 格式无此字段，但保留便于后续检索）
+                # 额外标签字段，保留便于后续检索
                 "tags": tags,
                 "year": year,
                 "season": season,
@@ -234,7 +241,7 @@ def main():
         sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
 
     parser = argparse.ArgumentParser(
-        description="casdu threads.jsonl → chexie faiss_meta.jsonl 格式转换"
+        description="threads.jsonl → faiss_meta.jsonl 格式转换"
     )
     parser.add_argument("--input", "-i",
                         default=str(DATA_DIR / "threads.jsonl"),
@@ -270,7 +277,7 @@ def main():
             record = json.loads(line)
             chunks = convert_record(record, args.max_chars, args.overlap)
             for chunk in chunks:
-                fout.write(json.dumps(chunk, ensure_ascii=False) + "\n")
+                fout.write(_safe_dumps(chunk) + "\n")
                 total_chunks += 1
             total_posts += 1
 
@@ -290,8 +297,7 @@ def main():
     print(f"  chunk 总数: {total_chunks}")
     print(f"  平均每帖 {total_chunks / max(total_posts, 1):.1f} chunk")
     print(f"  耗时: {elapsed:.0f}s")
-    print(f"\n下一步：")
-    print(f"  python build_chexie_faiss.py --meta-casdu {output_path}")
+    print(f"\n下一步：将 {output_path} 喂给 embedding 模型构建向量索引")
 
 
 if __name__ == "__main__":

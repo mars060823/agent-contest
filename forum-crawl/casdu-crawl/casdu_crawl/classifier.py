@@ -6,11 +6,11 @@ bbs.casdu.cn 爬虫 — 自动分类与标签引擎
 从帖子标题 + 正文中提取 7 类标签：
 
   1. year        — 年份（如 2026）
-  2. season      — 学期（如 春、秋、暑、寒、冬）
+  2. season      — 学期（如 春、秋、暑、寒）
   3. event_type  — 事件类型（如 通知、总结、报名）
   4. activity_type — 活动类型（如 拉练、远征、体训）
   5. routes      — 路线名（如 黄巢、玉符河）
-  6. roles       — 角色/职务（如 押后、队医）
+  6. roles       — 角色/职务（如 队长、协理、前骑）
   7. problems    — 问题类型（如 扎胎、摔车）
 
 输出格式：
@@ -21,7 +21,7 @@ bbs.casdu.cn 爬虫 — 自动分类与标签引擎
     "event_type": "总结",
     "activity_type": "拉练",
     "routes": ["黄巢"],
-    "roles": ["押后", "队医"],
+    "roles": ["队长", "队医"],
     "problems": [],
   }
 """
@@ -115,12 +115,12 @@ def _extract_year(text: str, title: str) -> str:
         return text_years[0]
 
     # 尝试两位年份 + 学期（如 26春 → 2026）
-    m = re.search(r'^(\d{2})\s*[春秋暑寒冬]', title)
+    m = re.search(r'^(\d{2})\s*[春秋暑寒]', title)
     if m:
         yy = int(m.group(1))
         return str(2000 + yy if yy < 50 else 1900 + yy)
 
-    m = re.search(r'(\d{2})\s*[春秋暑寒冬]', title)
+    m = re.search(r'(\d{2})\s*[春秋暑寒]', title)
     if m:
         yy = int(m.group(1))
         return str(2000 + yy if yy <= 50 else 1900 + yy)
@@ -129,9 +129,10 @@ def _extract_year(text: str, title: str) -> str:
 
 
 def _extract_season(text: str, title: str) -> str:
-    """提取学期（春/秋/暑/寒/冬）。
+    """
+    提取学期（春/秋/暑/寒）。
 
-    如：26春 → 春，2025秋 → 秋
+    如：26春 → 春；2025秋 → 秋
     """
     # 标题优先
     m = SEASON_PATTERN.search(title)
@@ -143,7 +144,7 @@ def _extract_season(text: str, title: str) -> str:
         return m.group(2)
 
     # 独立学期词
-    for s in ["暑", "寒", "冬"]:
+    for s in ["暑", "寒"]:
         if s in title[:30]:
             return s
     if "春" in title[:30]:
@@ -155,7 +156,7 @@ def _extract_season(text: str, title: str) -> str:
 
 
 def _extract_event_type(title: str) -> str:
-    """从标题提取事件类型（通知/总结/报名/探路/选拔/训练/比赛/讨论/复盘/公告）。
+    """从标题提取事件类型（通知/总结/报名/探路/选拔/训练/比赛/讨论/公告）。
 
     匹配优先级：精确词 > 模糊词，标题前半段权重更高。
     """
@@ -172,7 +173,7 @@ def _extract_event_type(title: str) -> str:
 
 
 def _extract_activity_type(title: str, scan_text: str) -> str:
-    """提取活动类型（拉练/远征/体训/行疆/冬游/实践/支教/比赛）。
+    """提取活动类型（拉练/远征/体训/行疆/实践/支教/比赛）。
 
     从标题中匹配，优先完整词。
     """

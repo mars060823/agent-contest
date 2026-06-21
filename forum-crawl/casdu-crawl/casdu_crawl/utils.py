@@ -349,7 +349,7 @@ def parse_thread_max_page(html: str) -> int:
 def clean_content(raw: str) -> str:
     """清洗 HTML 标签，保留纯文本段落。
 
-    参考 chexie-knowledge build_chexie_faiss.py 的 normalize_text()：
+    文本清洗规则：
 
     - \r\n, \r → \n（统一换行）
     - 　（全角空格）→ 半角空格

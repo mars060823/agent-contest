@@ -14,6 +14,34 @@ logger = logging.getLogger("casdu")
 
 
 # ============================================================================
+# 工具
+# ============================================================================
+
+def _sanitize_string(s: str) -> str:
+    """清理字符串中的 lone surrogate 字符（GBK 解码残留）。"""
+    if not isinstance(s, str):
+        return s
+    # 尝试编码为 UTF-8，替换无法编码的 surrogate
+    return s.encode("utf-8", errors="replace").decode("utf-8")
+
+
+def _sanitize_record(obj):
+    """递归清理 record 中的所有字符串字段。"""
+    if isinstance(obj, str):
+        return _sanitize_string(obj)
+    if isinstance(obj, dict):
+        return {k: _sanitize_record(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_record(v) for v in obj]
+    return obj
+
+
+def _safe_dumps(obj) -> str:
+    """json.dumps 的安全封装，自动清理 lone surrogate。"""
+    return json.dumps(_sanitize_record(obj), ensure_ascii=False)
+
+
+# ============================================================================
 # Threads JSONL
 # ============================================================================
 
@@ -30,10 +58,13 @@ class JsonlWriter:
         self._fd = self.path.open("a", encoding="utf-8")
 
     def write(self, record: dict):
-        """写入一行 JSON（追加）。"""
+        """写入一行 JSON（追加）。
+
+        自动处理 GBK 解码残留的 lone surrogate 字符。
+        """
         if self._fd is None:
             self.open()
-        line = json.dumps(record, ensure_ascii=False)
+        line = _safe_dumps(record)
         self._fd.write(line + "\n")
         self._fd.flush()
 
@@ -169,9 +200,9 @@ class IndexDB:
                 post.get("post_time", ""),
                 post.get("content", ""),
                 len(post.get("content", "")),
-                json.dumps(post.get("tags", []), ensure_ascii=False),
+                _safe_dumps(post.get("tags", [])),
                 post.get("category", ""),
-                json.dumps(post.get("meta", {}), ensure_ascii=False),
+                _safe_dumps(post.get("meta", {})),
             ),
         )
 
@@ -194,13 +225,13 @@ class IndexDB:
                 thread.get("first_author", ""),
                 thread.get("first_time", ""),
                 thread.get("post_count", 0),
-                json.dumps(thread.get("tags", []), ensure_ascii=False),
+                _safe_dumps(thread.get("tags", [])),
                 thread.get("year", ""),
                 thread.get("season", ""),
                 thread.get("event_type", ""),
-                json.dumps(thread.get("routes", []), ensure_ascii=False),
-                json.dumps(thread.get("roles", []), ensure_ascii=False),
-                json.dumps(thread.get("problems", []), ensure_ascii=False),
+                _safe_dumps(thread.get("routes", [])),
+                _safe_dumps(thread.get("roles", [])),
+                _safe_dumps(thread.get("problems", [])),
                 thread.get("last_crawl", ""),
                 thread.get("url", ""),
             ),
