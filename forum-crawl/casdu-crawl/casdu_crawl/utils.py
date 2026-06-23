@@ -726,17 +726,22 @@ def parse_forumdisplay_max_page(html: str) -> int:
 def normalize_post_time(raw: str) -> str:
     """将论坛 archiver 显示时间转为 ISO-8601 格式（UTC+8）。
 
+    archiver 实际格式为 "YYYY-M-D HH:MM:SS"（月日可能无前导零），
+    如 "2025-10-12 15:04:38" 或 "2018-3-3 12:05:51"。
+
     Args:
-        raw: 论坛时间字符串，如 "2025-10-12 15:04:38"
+        raw: 论坛时间字符串
 
     Returns:
         ISO-8601 格式，如 "2025-10-12T15:04:38+08:00"。无法识别则返回原字符串。
     """
     if not raw:
         return ""
-    m = re.match(r"(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})", raw)
+    # 匹配 "YYYY-M-D HH:MM:SS"（月日可为 1-2 位数字）
+    m = re.match(r"(\d{4})-(\d{1,2})-(\d{1,2})\s+(\d{2}:\d{2}:\d{2})", raw)
     if m:
-        return f"{m.group(1)}T{m.group(2)}+08:00"
+        y, mo, d, t = m.group(1), m.group(2), m.group(3), m.group(4)
+        return f"{y}-{int(mo):02d}-{int(d):02d}T{t}+08:00"
     return raw
 
 
