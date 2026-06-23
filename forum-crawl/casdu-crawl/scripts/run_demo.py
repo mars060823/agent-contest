@@ -34,11 +34,12 @@ from casdu_crawl.config import (
     PROJECT_ROOT,
 )
 from casdu_crawl.utils import (
+    setup_console_utf8,
     create_session, fetch,
     discover_boards, parse_board_page, parse_board_max_page,
-    parse_thread_posts, parse_thread_max_page,
+    parse_thread_posts, parse_thread_max_page, parse_reply_to,
     make_board_url, make_thread_url, thread_web_url,
-    format_duration,
+    normalize_post_time, format_duration,
 )
 from casdu_crawl.storage import JsonlWriter
 from casdu_crawl.classifier import classify
@@ -53,22 +54,11 @@ SUMMARY_PATH = DEMO_DIR / "summary.json"
 # ---------------------------------------------------------------------------
 # 日志
 # ---------------------------------------------------------------------------
-console_handler = logging.StreamHandler(sys.stdout)
-_orig_write = console_handler.stream.write
-
-def _safe_write(msg):
-    try:
-        _orig_write(msg)
-    except UnicodeEncodeError:
-        _orig_write(msg.encode("ascii", errors="replace").decode("ascii"))
-
-console_handler.stream.write = _safe_write
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
-    handlers=[console_handler],
+    handlers=[setup_console_utf8()],
 )
 logger = logging.getLogger("casdu-demo")
 
@@ -211,6 +201,9 @@ def crawl_threads(
                     board_name=board_name,
                 )
 
+                # 提取楼层回复引用
+                reply_to_floor, reply_to_user = parse_reply_to(post.get("content", ""))
+
                 record = {
                     "tid": tid,
                     "fid": fid,
@@ -221,10 +214,17 @@ def crawl_threads(
                     "floor": floor,
                     "page": (floor - 1) // 15 + 1,
                     "position": ((floor - 1) % 15) + 1,
-                    "post_time": post.get("post_time", ""),
+                    "post_time": normalize_post_time(post.get("post_time", "")),
                     "content": post.get("content", ""),
+                    "content_len": len(post.get("content", "")),
+                    "thread_total_floors": len(all_posts),
                     "url": thread_web_url(tid),
+                    "digest": 0,
                     "sticky": 2 if is_sticky else 0,
+                    "closed": 0,
+                    "reply_to_floor": reply_to_floor,
+                    "reply_to_user": reply_to_user or "",
+                    "meta": {},
                     **tags_info,
                 }
                 records.append(record)
@@ -251,7 +251,6 @@ def main():
                         help="随机种子（默认 42，可复现）")
     args = parser.parse_args()
 
-    random.seed(args.seed)
     rng = random.Random(args.seed)
     DEMO_DIR.mkdir(parents=True, exist_ok=True)
     t0 = time.time()

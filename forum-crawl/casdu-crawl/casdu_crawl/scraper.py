@@ -23,6 +23,8 @@ bbs.casdu.cn 论坛爬虫 — 主控脚本
   CASDU_PASS  论坛登录密码
 """
 
+from __future__ import annotations
+
 import argparse
 import io
 import logging
@@ -38,12 +40,13 @@ from casdu_crawl.config import (
     PROJECT_ROOT,
 )
 from casdu_crawl.utils import (
+    setup_console_utf8,
     create_session, fetch,
     discover_boards,
-    parse_board_page, parse_board_max_page,
-    parse_thread_posts, parse_thread_max_page,
-    make_board_url, make_thread_url, thread_web_url,
-    format_duration,
+    parse_forumdisplay_page, parse_forumdisplay_max_page,
+    parse_thread_posts, parse_thread_max_page, parse_reply_to,
+    make_board_url, make_forumdisplay_url, make_thread_url, thread_web_url,
+    normalize_post_time, format_duration,
     fetch_thread_meta,
 )
 from casdu_crawl.storage import JsonlWriter, IndexDB, Checkpoint, DEFAULT_CHECKPOINT
@@ -60,23 +63,12 @@ DB_PATH = DATA_DIR / "index.db"
 CHECKPOINT_PATH = DATA_DIR / "checkpoint.json"
 FAILED_LOG_PATH = LOGS_DIR / "failed_urls.log"
 
-# 控制台 handler：强制 UTF-8（避免 Windows GBK 终端乱码）
-console_handler = logging.StreamHandler(sys.stdout)
-# 重写 write 方法以处理编码错误
-_orig_write = console_handler.stream.write
-def _safe_write(msg):
-    try:
-        _orig_write(msg)
-    except UnicodeEncodeError:
-        _orig_write(msg.encode('ascii', errors='replace').decode('ascii'))
-console_handler.stream.write = _safe_write
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
     handlers=[
-        console_handler,
+        setup_console_utf8(),
         logging.FileHandler(LOGS_DIR / "scraper.log", encoding="utf-8"),
     ],
 )
@@ -113,6 +105,225 @@ def boards_from_discovery(session) -> list[tuple[int, str, str]]:
 
 
 # ============================================================================
+# 共享：单线程处理（全量 & 增量共用）
+# ============================================================================
+
+def _process_thread_posts(
+    session,
+    tid: int,
+    fid: int,
+    title: str,
+    board_name: str,
+    digest: int,
+    sticky: int,
+    closed: int,
+    jsonl: JsonlWriter,
+    db: IndexDB,
+    *,
+    with_meta: bool = False,
+    skip_existing: int = 0,
+    all_uids: set[int] | None = None,
+) -> tuple[int, int, bool]:
+    """处理单个主题帖的全部楼层：翻页爬取、分类标签、JSONL写入、DB插入。
+
+    全量和增量模式的共享内核。调用方只需指定 skip_existing 即可：
+      - 全量模式: skip_existing=0（处理所有楼层）
+      - 增量模式: skip_existing=已存在楼层数（仅处理新楼层）
+
+    Args:
+        session: 已配置的 requests.Session
+        tid ~ closed: 主题帖元数据
+        jsonl: JSONL 写入器
+        db: SQLite 数据库
+        with_meta: 是否抓取主站互动元数据
+        skip_existing: 跳过的已有楼层数（0 = 全部处理）
+        all_uids: 全局 UID 收集集合（原地修改）
+
+    Returns:
+        (new_posts_count, total_posts_count, error_flag)
+    """
+    if all_uids is None:
+        all_uids = set()
+
+    cat = BOARD_CATEGORIES.get(fid, (board_name, "未分类"))[1]
+
+    # ── 翻页抓取 ──
+    url = make_thread_url(tid, 1)
+    html = fetch(url, session, force_no_delay=True)
+
+    if "提示信息" in html[:200] and "class=\"author\"" not in html:
+        logger.warning("  → tid=%d 返回错误页，跳过", tid)
+        return 0, 0, True
+
+    post_pages = parse_thread_max_page(html)
+    all_posts = parse_thread_posts(html)
+    posts_by_page: dict[int, list[dict]] = {1: list(all_posts)}
+
+    logger.info("  → 第 1/%d 页: %d 帖", post_pages, len(all_posts))
+
+    for page in range(2, post_pages + 1):
+        html = fetch(make_thread_url(tid, page), session)
+        page_posts = parse_thread_posts(html)
+        posts_by_page[page] = page_posts
+        all_posts.extend(page_posts)
+        logger.info("  → 第 %d/%d 页: %d 帖", page, post_pages, len(page_posts))
+
+    new_post_count = 0
+    total_post_count = len(all_posts)
+
+    # ── 元数据抓取（按需） ──
+    metas_by_page: dict[int, dict[int, dict]] = {}
+    if with_meta:
+        if skip_existing == 0:
+            # 全量模式：所有页都抓元数据
+            pages_to_fetch = sorted(posts_by_page.keys())
+        else:
+            # 增量模式：仅抓取包含新楼层的页
+            pages_to_fetch = sorted({
+                (pos - 1) // 15 + 1
+                for pos in range(skip_existing + 1, total_post_count + 1)
+            })
+
+        for page in pages_to_fetch:
+            try:
+                page_metas = fetch_thread_meta(tid, page, session)
+                metas_by_page[page] = {m["pid"]: m for m in page_metas}
+                logger.debug("  → 元数据 第%d页: %d 帖", page, len(page_metas))
+            except Exception as e:
+                logger.warning("  → 元数据获取失败 第%d页: %s", page, e)
+                metas_by_page[page] = {}
+
+    # ── 按页处理楼层 ──
+    for page in sorted(posts_by_page.keys()):
+        for pos_in_page, post in enumerate(posts_by_page[page], start=1):
+            floor = (page - 1) * 15 + pos_in_page
+            if floor <= skip_existing:
+                continue
+
+            new_post_count += 1
+
+            # 分类标签
+            tags_info = classify(
+                title=title,
+                content=post["content"],
+                board_name=board_name,
+            )
+            if sticky:
+                tags_info.setdefault("tags", [])
+                if "置顶" not in tags_info["tags"]:
+                    tags_info["tags"].insert(0, "置顶")
+
+            # 回复引用
+            reply_to_floor, reply_to_user = parse_reply_to(post["content"])
+
+            # 构建记录
+            record = {
+                "tid": tid,
+                "fid": fid,
+                "board": board_name,
+                "category": cat,
+                "title": title,
+                "author": post["author"],
+                "floor": floor,
+                "page": page,
+                "position": pos_in_page,
+                "post_time": normalize_post_time(post["post_time"]),
+                "content": post["content"],
+                "content_len": len(post["content"]),
+                "thread_total_floors": total_post_count,
+                "url": thread_web_url(tid),
+                "digest": digest,
+                "sticky": sticky,
+                "closed": closed,
+                "reply_to_floor": reply_to_floor,
+                "reply_to_user": reply_to_user or "",
+                **tags_info,
+            }
+
+            # 管理标记
+            if digest:
+                record["tags"].append("精华")
+            if sticky:
+                record["tags"].append("置顶")
+            if closed:
+                record["tags"].append("关闭")
+
+            # 互动元数据匹配
+            if with_meta:
+                page_meta = metas_by_page.get(page, {})
+                matched = None
+                if pos_in_page <= len(page_meta):
+                    meta_list = list(page_meta.values())
+                    matched = meta_list[pos_in_page - 1]
+                if matched:
+                    record["meta"] = {
+                        "rating_count": matched.get("rating_count", 0),
+                        "rating_coins": matched.get("rating_coins", 0),
+                        "rating_details": matched.get("rating_details", []),
+                        "recommend_add": matched.get("recommend_add", 0),
+                        "recommend_subtract": matched.get("recommend_subtract", 0),
+                        "favorite_count": matched.get("favorite_count", 0),
+                        "comment_count": matched.get("comment_count", 0),
+                        "comments": matched.get("comments", []),
+                        "author_uid": matched.get("author_uid"),
+                    }
+                    record["real_pid"] = matched.get("pid")
+                    if matched.get("author_uid"):
+                        all_uids.add(matched["author_uid"])
+                    for r in matched.get("rating_details", []):
+                        if r.get("uid"):
+                            all_uids.add(r["uid"])
+                    for c in matched.get("comments", []):
+                        if c.get("uid"):
+                            all_uids.add(c["uid"])
+                    db.insert_ratings(
+                        tid, floor, matched.get("pid"),
+                        matched.get("rating_details", []),
+                    )
+                else:
+                    record["meta"] = {}
+
+            jsonl.write(record)
+            db.insert_post(record)
+
+    # ── 主题表 upsert ──
+    thread_tags = classify(
+        title=title,
+        content=all_posts[0]["content"] if all_posts else "",
+        board_name=board_name,
+    )
+    thread_tags_list = list(thread_tags["tags"])
+    if digest:
+        thread_tags_list.append("精华")
+    if sticky:
+        thread_tags_list.append("置顶")
+    if closed:
+        thread_tags_list.append("关闭")
+    db.upsert_thread({
+        "tid": tid, "fid": fid, "board": board_name, "category": cat,
+        "title": title,
+        "first_author": all_posts[0]["author"] if all_posts else "",
+        "first_time": all_posts[0]["post_time"] if all_posts else "",
+        "post_count": total_post_count,
+        "digest": digest,
+        "sticky": sticky,
+        "closed": closed,
+        "tags": thread_tags_list,
+        "year": thread_tags["year"],
+        "season": thread_tags["season"],
+        "event_type": thread_tags["event_type"],
+        "routes": thread_tags["routes"],
+        "roles": thread_tags["roles"],
+        "problems": thread_tags["problems"],
+        "last_crawl": datetime.now(timezone.utc).isoformat(),
+        "url": thread_web_url(tid),
+    })
+    db.commit()
+
+    return new_post_count, total_post_count, False
+
+
+# ============================================================================
 # 全量爬取
 # ============================================================================
 
@@ -134,6 +345,9 @@ def crawl_full(
     """
     t0 = time.time()
 
+    # UID 收集集合（用于用户信息爬取）
+    all_uids: set[int] = set()
+
     # ── Phase 1: 版块发现 ──
     logger.info("=" * 50)
     logger.info("Phase 1: 发现版块")
@@ -151,10 +365,12 @@ def crawl_full(
 
     # ── Phase 2: 收集线程列表 ──
     logger.info("=" * 50)
-    logger.info("Phase 2: 收集线程列表")
+    logger.info("Phase 2: 收集线程列表 (forumdisplay.php)")
     logger.info("=" * 50)
 
-    thread_queue: list[tuple[int, int, str, str]] = []  # (tid, fid, title, board_name)
+    # (tid, fid, title, board_name, digest, sticky, closed)
+    thread_queue: list[tuple[int, int, str, str, int, int, int]] = []
+    seen_global_stickies: set[int] = set()  # 全局/分区置顶帖去重
 
     for fid, board_name, category in all_boards:
         if ck.is_board_complete(fid):
@@ -165,7 +381,7 @@ def crawl_full(
         logger.info("收集版块: fid=%d (%s)", fid, board_name)
 
         # 获取第一页，同时探测总页数
-        url = make_board_url(fid, 1)
+        url = make_forumdisplay_url(fid, 1)
         logger.info("  第 1 页: %s", url)
         if dry_run:
             logger.info("  [dry-run] 跳过下载")
@@ -173,23 +389,48 @@ def crawl_full(
 
         html = fetch(url, session, force_no_delay=True)
 
-        # 解析第一页的线程
-        threads_p1 = parse_board_page(html)
-        max_page = parse_board_max_page(html)
-        logger.info("  第 1 页: %d 个帖子 | 共 %d 页", len(threads_p1), max_page)
+        # 解析第一页的线程 + 元数据
+        fd_meta = parse_forumdisplay_page(html)
+        max_page = parse_forumdisplay_max_page(html)
+        logger.info("  第 1 页: %d 个帖子 | 共 %d 页", len(fd_meta), max_page)
 
-        for tid, title in threads_p1:
-            thread_queue.append((tid, fid, title, board_name))
+        sticky_skipped = 0
+        for tid, meta in fd_meta.items():
+            sticky = meta.get("sticky", 0)
+            # 全局置顶(sticky=3)/分区置顶(sticky=2) 去重：先到先得
+            if sticky >= 2:
+                if tid in seen_global_stickies:
+                    sticky_skipped += 1
+                    continue
+                seen_global_stickies.add(tid)
+            thread_queue.append((
+                tid, fid, meta.get("title", ""), board_name,
+                meta.get("digest", 0),
+                sticky,
+                meta.get("closed", 0),
+            ))
+        if sticky_skipped:
+            logger.info("    → 跳过 %d 个已收录的全局/分区置顶帖", sticky_skipped)
 
         # 翻页抓取
         for page in range(2, max_page + 1):
-            url = make_board_url(fid, page)
+            url = make_forumdisplay_url(fid, page)
             logger.info("  第 %d/%d 页: %s", page, max_page, url)
             html = fetch(url, session)
-            page_threads = parse_board_page(html)
-            logger.info("    → %d 个帖子", len(page_threads))
-            for tid, title in page_threads:
-                thread_queue.append((tid, fid, title, board_name))
+            page_meta = parse_forumdisplay_page(html)
+            logger.info("    → %d 个帖子", len(page_meta))
+            for tid, meta in page_meta.items():
+                sticky = meta.get("sticky", 0)
+                if sticky >= 2:
+                    if tid in seen_global_stickies:
+                        continue
+                    seen_global_stickies.add(tid)
+                thread_queue.append((
+                    tid, fid, meta.get("title", ""), board_name,
+                    meta.get("digest", 0),
+                    sticky,
+                    meta.get("closed", 0),
+                ))
 
         # 版块完成，写检查点
         ck.mark_board_complete(fid)
@@ -213,157 +454,51 @@ def crawl_full(
     processed = 0
     error_count = 0
 
-    for idx, (tid, fid, title, board_name) in enumerate(thread_queue, start=1):
+    for idx, (tid, fid, title, board_name, digest, sticky, closed) in enumerate(thread_queue, start=1):
         # 从 checkpoint 判断是否跳过已处理的帖子
         last_processed = ck.get_thread_progress(fid)
         if tid <= last_processed and db.thread_exists(tid):
             continue
 
-        cat = BOARD_CATEGORIES.get(fid, (board_name, "未分类"))[1]
-
         logger.info("[%d/%d] tid=%d: %s", idx, total_threads, tid, title[:60])
 
-        try:
-            # 获取帖子第一页
-            url = make_thread_url(tid, 1)
-            html = fetch(url, session, force_no_delay=True)
+        new_count, total_count, err = _process_thread_posts(
+            session, tid, fid, title, board_name, digest, sticky, closed,
+            jsonl, db,
+            with_meta=with_meta,
+            all_uids=all_uids,
+        )
 
-            # 检查是否是错误页（如 tid 不存在）
-            if "提示信息" in html[:200] and "class=\"author\"" not in html:
-                logger.warning("  → tid=%d 返回错误页，跳过", tid)
-                error_count += 1
-                continue
-
-            post_pages = parse_thread_max_page(html)
-            all_posts = parse_thread_posts(html)
-
-            logger.info("  → 第 1/%d 页: %d 帖", post_pages, len(all_posts))
-
-            # 记录每页的帖子（page → [posts]）
-            posts_by_page: dict[int, list[dict]] = {1: list(all_posts)}
-
-            # 翻页
-            for page in range(2, post_pages + 1):
-                url = make_thread_url(tid, page)
-                html = fetch(url, session)
-                page_posts = parse_thread_posts(html)
-                posts_by_page[page] = page_posts
-                all_posts.extend(page_posts)
-                logger.info("  → 第 %d/%d 页: %d 帖", page, post_pages, len(page_posts))
-
-            # 可选：抓取主站互动元数据
-            metas_by_page: dict[int, dict[int, dict]] = {}
-            if with_meta:
-                for page in sorted(posts_by_page.keys()):
-                    try:
-                        page_metas = fetch_thread_meta(tid, page, session)
-                        # 按 pid 索引
-                        metas_by_page[page] = {m["pid"]: m for m in page_metas}
-                        logger.debug("  → 元数据 第%d页: %d 帖", page, len(page_metas))
-                    except Exception as e:
-                        logger.warning("  → 元数据获取失败 第%d页: %s", page, e)
-                        metas_by_page[page] = {}
-
-            # 分类标签 → 写入（按页处理，正确计算楼层）
-            for page in sorted(posts_by_page.keys()):
-                for pos_in_page, post in enumerate(posts_by_page[page], start=1):
-                    floor = (page - 1) * 15 + pos_in_page
-                    tags_info = classify(
-                        title=title,
-                        content=post["content"],
-                        board_name=board_name,
-                    )
-
-                    # JSONL 记录
-                    record = {
-                        "tid": tid,
-                        "fid": fid,
-                        "board": board_name,
-                        "category": cat,
-                        "title": title,
-                        "author": post["author"],
-                        "floor": floor,
-                        "page": page,
-                        "position": pos_in_page,
-                        "post_time": post["post_time"],
-                        "content": post["content"],
-                        "url": thread_web_url(tid),
-                        **tags_info,
-                    }
-                    # 合并互动元数据（如果启用）
-                    if with_meta:
-                        page_meta = metas_by_page.get(page, {})
-                        # archiver 无 pid，按楼层位置匹配（archiver 每页15帖，位置对齐）
-                        matched = None
-                        if pos_in_page <= len(page_meta):
-                            meta_list = list(page_meta.values())
-                            matched = meta_list[pos_in_page - 1]
-                        if matched:
-                            record["meta"] = {
-                                "rating_count": matched.get("rating_count", 0),
-                                "rating_coins": matched.get("rating_coins", 0),
-                                "rating_details": matched.get("rating_details", []),
-                                "recommend_add": matched.get("recommend_add", 0),
-                                "recommend_subtract": matched.get("recommend_subtract", 0),
-                                "favorite_count": matched.get("favorite_count", 0),
-                                "comment_count": matched.get("comment_count", 0),
-                                "comments": matched.get("comments", []),
-                            }
-                        else:
-                            record["meta"] = {}
-
-                    jsonl.write(record)
-
-                    # DB 记录
-                    db.insert_post(record)
-
-            # 主题表记录（用首帖内容生成标签）
-            thread_tags = classify(
-                title=title,
-                content=all_posts[0]["content"] if all_posts else "",
-                board_name=board_name,
-            )
-            db.upsert_thread({
-                "tid": tid, "fid": fid, "board": board_name, "category": cat,
-                "title": title,
-                "first_author": all_posts[0]["author"] if all_posts else "",
-                "first_time": all_posts[0]["post_time"] if all_posts else "",
-                "post_count": len(all_posts),
-                "tags": thread_tags["tags"],
-                "year": thread_tags["year"],
-                "season": thread_tags["season"],
-                "event_type": thread_tags["event_type"],
-                "routes": thread_tags["routes"],
-                "roles": thread_tags["roles"],
-                "problems": thread_tags["problems"],
-                "last_crawl": datetime.now(timezone.utc).isoformat(),
-                "url": thread_web_url(tid),
-            })
-            db.commit()
-
-            processed += 1
-            ck.update_thread_progress(fid, tid)
-            ck.update_highest_tid(tid)
-            ck.increment_posts(len(all_posts))
-
-            # 批次冷却
-            if processed % BATCH_SIZE == 0:
-                logger.info("[WAIT] 已完成 %d/%d 个帖子，冷却 %ds ...",
-                            processed, total_threads, COOLDOWN)
-                time.sleep(COOLDOWN)
-                ck.save()  # 每批次保存检查点
-
-        except Exception as e:
-            logger.error("[ERR] tid=%d 爬取异常: %s", tid, e, exc_info=True)
-            log_failed(make_thread_url(tid), str(e))
+        if err:
             error_count += 1
-            # 继续处理下一个，不中断
-            time.sleep(COOLDOWN)  # 出错后额外冷却
+            log_failed(make_thread_url(tid))
+            time.sleep(COOLDOWN)
+            continue
+
+        processed += 1
+        ck.update_thread_progress(fid, tid)
+        ck.update_highest_tid(tid)
+        ck.increment_posts(total_count)
+
+        # 批次冷却
+        if processed % BATCH_SIZE == 0:
+            logger.info("[WAIT] 已完成 %d/%d 个帖子，冷却 %ds ...",
+                        processed, total_threads, COOLDOWN)
+            time.sleep(COOLDOWN)
+            ck.save()
 
     # ── 完成 ──
     elapsed = time.time() - t0
     ck.data["last_full_crawl"] = datetime.now(timezone.utc).isoformat()
     ck.save()
+
+    # 写入 UID 集合文件
+    if all_uids:
+        uid_path = DATA_DIR / "known_uids.txt"
+        with uid_path.open("w", encoding="utf-8") as f:
+            for uid in sorted(all_uids):
+                f.write(f"{uid}\n")
+        logger.info("  收集 UID: %d 个 → %s", len(all_uids), uid_path.name)
 
     logger.info("=" * 50)
     logger.info("全量爬取完成！")
@@ -402,9 +537,12 @@ def crawl_incremental(
     prev_highest_tid = ck.data["highest_tid_seen"]
     logger.info("上次全量最大 tid: %d", prev_highest_tid)
 
+    all_uids: set[int] = set()
+
     all_boards = boards_from_discovery(session)
-    new_tids: list[tuple[int, int, str, str]] = []
-    updated_tids: list[tuple[int, int, str, str]] = []
+    # (tid, fid, title, board_name, digest, sticky, closed)
+    new_tids: list[tuple[int, int, str, str, int, int, int]] = []
+    updated_tids: list[tuple[int, int, str, str, int, int, int]] = []
 
     for fid, board_name, category in all_boards:
         logger.info("─" * 40)
@@ -412,19 +550,22 @@ def crawl_incremental(
 
         # 只检查前 2 页（新帖通常在首页）
         for page in [1, 2]:
-            url = make_board_url(fid, page)
+            url = make_forumdisplay_url(fid, page)
             logger.info("  第 %d 页: %s", page, url)
 
             if dry_run:
-                page_threads = []  # skip
                 continue
 
             html = fetch(url, session, force_no_delay=True)
-            page_threads = parse_board_page(html)
+            fd_meta = parse_forumdisplay_page(html)
 
-            for tid, title in page_threads:
+            for tid, meta in fd_meta.items():
+                title = meta.get("title", "")
+                digest = meta.get("digest", 0)
+                sticky = meta.get("sticky", 0)
+                closed = meta.get("closed", 0)
                 if tid > prev_highest_tid:
-                    new_tids.append((tid, fid, title, board_name))
+                    new_tids.append((tid, fid, title, board_name, digest, sticky, closed))
                 else:
                     # 旧帖：检查是否有新回复
                     existing_count = db.post_count_for_thread(tid)
@@ -446,7 +587,7 @@ def crawl_incremental(
                             total_current = len(current_posts)
 
                         if total_current > existing_count:
-                            updated_tids.append((tid, fid, title, board_name))
+                            updated_tids.append((tid, fid, title, board_name, digest, sticky, closed))
                             logger.info("  → tid=%d 有新回复 (%d→%d)",
                                         tid, existing_count, total_current)
                     except Exception as e:
@@ -462,62 +603,34 @@ def crawl_incremental(
     all_to_crawl = new_tids + updated_tids
     total = len(all_to_crawl)
 
-    # 复用全量爬取 Phase 3 的帖子抓取逻辑
-    for idx, (tid, fid, title, board_name) in enumerate(all_to_crawl, start=1):
-        cat = BOARD_CATEGORIES.get(fid, ("", "未分类"))[1]
+    for idx, (tid, fid, title, board_name, digest, sticky, closed) in enumerate(all_to_crawl, start=1):
         logger.info("[%d/%d] tid=%d: %s", idx, total, tid, title[:60])
 
-        try:
-            url = make_thread_url(tid, 1)
-            html = fetch(url, session, force_no_delay=True)
-            post_pages = parse_thread_max_page(html)
-            all_posts = parse_thread_posts(html)
+        existing_count = db.post_count_for_thread(tid)
+        new_count, total_count, err = _process_thread_posts(
+            session, tid, fid, title, board_name, digest, sticky, closed,
+            jsonl, db,
+            with_meta=with_meta,
+            skip_existing=existing_count,
+            all_uids=all_uids,
+        )
 
-            for page in range(2, post_pages + 1):
-                html = fetch(make_thread_url(tid, page), session)
-                all_posts.extend(parse_thread_posts(html))
+        if err:
+            continue
 
-            # 增量模式下：跳过已存在的楼层
-            existing_count = db.post_count_for_thread(tid)
-            new_posts = all_posts[existing_count:]
-
-            for pos, post in enumerate(all_posts, start=1):
-                if pos <= existing_count:
-                    continue  # 跳过已有楼层
-
-                tags_info = classify(title, post["content"], board_name)
-                record = {
-                    "tid": tid, "fid": fid, "board": board_name,
-                    "category": cat, "title": title,
-                    "author": post["author"], "floor": pos,
-                    "page": (pos - 1) // 15 + 1, "position": pos,
-                    "post_time": post["post_time"],
-                    "content": post["content"],
-                    "url": thread_web_url(tid),
-                    **tags_info,
-                }
-                jsonl.write(record)
-                db.insert_post(record)
-
-            db.upsert_thread({
-                "tid": tid, "fid": fid, "board": board_name, "category": cat,
-                "title": title,
-                "first_author": all_posts[0]["author"] if all_posts else "",
-                "first_time": all_posts[0]["post_time"] if all_posts else "",
-                "post_count": len(all_posts),
-                "last_crawl": datetime.now(timezone.utc).isoformat(),
-                "url": thread_web_url(tid),
-            })
-            db.commit()
-
-            ck.update_highest_tid(tid)
-            ck.increment_posts(len(new_posts))
-
-        except Exception as e:
-            logger.error("❌ tid=%d 爬取异常: %s", tid, e)
+        ck.update_highest_tid(tid)
+        ck.increment_posts(new_count)
 
     ck.data["last_full_crawl"] = datetime.now(timezone.utc).isoformat()
     ck.save()
+
+    # 写入 UID 集合文件
+    if all_uids:
+        uid_path = DATA_DIR / "known_uids.txt"
+        with uid_path.open("w", encoding="utf-8") as f:
+            for uid in sorted(all_uids):
+                f.write(f"{uid}\n")
+        logger.info("  收集 UID: %d 个 → %s", len(all_uids), uid_path.name)
 
     elapsed = time.time() - t0
     logger.info("=" * 50)
@@ -633,15 +746,15 @@ def main():
         jsonl.open()
         db.open()
 
-        if args.full or args.dry_run:
+        if args.incremental:
+            crawl_incremental(session, jsonl, db, ck,
+                              dry_run=args.dry_run,
+                              with_meta=args.with_meta)
+        elif args.full or args.dry_run:
             crawl_full(session, jsonl, db, ck,
                        fid_filter=args.fid,
                        dry_run=args.dry_run,
                        with_meta=args.with_meta)
-        elif args.incremental:
-            crawl_incremental(session, jsonl, db, ck,
-                              dry_run=args.dry_run,
-                              with_meta=args.with_meta)
         else:
             parser.print_help()
     finally:
