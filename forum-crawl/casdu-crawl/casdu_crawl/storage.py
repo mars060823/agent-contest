@@ -104,12 +104,18 @@ CREATE TABLE IF NOT EXISTS threads (
     roles       TEXT NOT NULL DEFAULT '[]',
     problems    TEXT NOT NULL DEFAULT '[]',
     last_crawl  TEXT NOT NULL DEFAULT '',
-    url         TEXT NOT NULL DEFAULT ''
+    url         TEXT NOT NULL DEFAULT '',
+    digest      INTEGER NOT NULL DEFAULT 0,
+    sticky      INTEGER NOT NULL DEFAULT 0,
+    closed      INTEGER NOT NULL DEFAULT 0
 );
 
 -- 回帖表（每层楼一行）
+-- pid: SQLite 内部行号（AUTOINCREMENT，用于 FTS5 rowid 关联）
+-- real_pid: Discuz 论坛原生帖子 ID（仅在 --with-meta 模式下可用）
 CREATE TABLE IF NOT EXISTS posts (
     pid         INTEGER PRIMARY KEY AUTOINCREMENT,
+    real_pid    INTEGER,
     tid         INTEGER NOT NULL,
     fid         INTEGER NOT NULL,
     board       TEXT NOT NULL DEFAULT '',
@@ -124,12 +130,15 @@ CREATE TABLE IF NOT EXISTS posts (
     tags        TEXT NOT NULL DEFAULT '[]',
     category    TEXT NOT NULL DEFAULT '',
     meta        TEXT NOT NULL DEFAULT '{}',
+    reply_to_floor INTEGER,
+    reply_to_user  TEXT NOT NULL DEFAULT '',
     FOREIGN KEY (tid) REFERENCES threads(tid)
 );
 
 CREATE INDEX IF NOT EXISTS idx_posts_tid ON posts(tid);
 CREATE INDEX IF NOT EXISTS idx_posts_fid ON posts(fid);
 CREATE INDEX IF NOT EXISTS idx_posts_author ON posts(author);
+CREATE INDEX IF NOT EXISTS idx_posts_real_pid ON posts(real_pid);
 CREATE INDEX IF NOT EXISTS idx_threads_fid ON threads(fid);
 CREATE INDEX IF NOT EXISTS idx_threads_category ON threads(category);
 CREATE INDEX IF NOT EXISTS idx_threads_year ON threads(year);
@@ -161,6 +170,21 @@ CREATE TRIGGER IF NOT EXISTS posts_au AFTER UPDATE ON posts BEGIN
     INSERT INTO fts_posts(rowid, title, author, content)
     VALUES (new.pid, new.title, new.author, new.content);
 END;
+
+-- 评分表（从 meta.rating_details 拆出）
+CREATE TABLE IF NOT EXISTS ratings (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    post_real_pid   INTEGER,
+    tid             INTEGER NOT NULL,
+    floor           INTEGER,
+    rater_uid       INTEGER,
+    rater_name      TEXT NOT NULL DEFAULT '',
+    coins           INTEGER NOT NULL DEFAULT 0,
+    reason          TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_ratings_tid ON ratings(tid);
+CREATE INDEX IF NOT EXISTS idx_ratings_post ON ratings(post_real_pid);
 """
 
 
@@ -178,17 +202,41 @@ class IndexDB:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.executescript(SCHEMA_SQL)
+        # 迁移：为旧数据库添加 real_pid 列
+        self._migrate_add_column("posts", "real_pid", "INTEGER")
+        # 迁移：为旧数据库添加 精华/置顶/关闭 列
+        self._migrate_add_column("threads", "digest", "INTEGER NOT NULL DEFAULT 0")
+        self._migrate_add_column("threads", "sticky", "INTEGER NOT NULL DEFAULT 0")
+        self._migrate_add_column("threads", "closed", "INTEGER NOT NULL DEFAULT 0")
+        # 迁移：posts 表新增回复引用列
+        self._migrate_add_column("posts", "reply_to_floor", "INTEGER")
+        self._migrate_add_column("posts", "reply_to_user", "TEXT NOT NULL DEFAULT ''")
         self.conn.commit()
+
+    def _migrate_add_column(self, table: str, column: str, col_type: str):
+        """安全添加列（忽略已存在的列）。"""
+        try:
+            self.conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN {column} {col_type}"
+            )
+            logger.info("数据库迁移: %s.%s (%s) 已添加", table, column, col_type)
+        except sqlite3.OperationalError as e:
+            if "duplicate column" in str(e).lower() or "already exists" in str(e).lower():
+                pass  # 列已存在，无需操作
+            else:
+                raise
 
     def insert_post(self, post: dict):
         """插入一条回帖记录（同时触发 FTS5 同步）。"""
         if self.conn is None:
             self.open()
         self.conn.execute(
-            "INSERT INTO posts (tid, fid, board, title, author, floor, "
-            "page, position, post_time, content, content_len, tags, category, meta) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO posts (real_pid, tid, fid, board, title, author, floor, "
+            "page, position, post_time, content, content_len, tags, category, meta, "
+            "reply_to_floor, reply_to_user) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
+                post.get("real_pid"),
                 post.get("tid", 0),
                 post.get("fid", 0),
                 post.get("board", ""),
@@ -203,7 +251,33 @@ class IndexDB:
                 _safe_dumps(post.get("tags", [])),
                 post.get("category", ""),
                 _safe_dumps(post.get("meta", {})),
+                post.get("reply_to_floor"),
+                post.get("reply_to_user") or "",
             ),
+        )
+
+    def insert_ratings(self, tid: int, floor: int, real_pid,
+                       ratings: list[dict]):
+        """批量插入评分记录。
+
+        Args:
+            tid: 主题帖 ID
+            floor: 被评分的楼层号
+            real_pid: 被评分帖子的 Discuz 原生 pid
+            ratings: [{uid, username, coins, reason}, ...]
+        """
+        if not ratings or self.conn is None:
+            return
+        self.conn.executemany(
+            "INSERT INTO ratings (post_real_pid, tid, floor, "
+            "rater_uid, rater_name, coins, reason) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                (real_pid, tid, floor,
+                 r.get("uid"), r.get("username", ""),
+                 r.get("coins", 0), r.get("reason", ""))
+                for r in ratings
+            ],
         )
 
     def upsert_thread(self, thread: dict):
@@ -214,8 +288,8 @@ class IndexDB:
             "INSERT OR REPLACE INTO threads "
             "(tid, fid, board, category, title, first_author, first_time, "
             "post_count, tags, year, season, event_type, routes, roles, "
-            "problems, last_crawl, url) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "problems, last_crawl, url, digest, sticky, closed) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 thread.get("tid", 0),
                 thread.get("fid", 0),
@@ -234,6 +308,9 @@ class IndexDB:
                 _safe_dumps(thread.get("problems", [])),
                 thread.get("last_crawl", ""),
                 thread.get("url", ""),
+                thread.get("digest", 0),
+                thread.get("sticky", 0),
+                thread.get("closed", 0),
             ),
         )
 

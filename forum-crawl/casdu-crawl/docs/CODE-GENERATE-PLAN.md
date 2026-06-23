@@ -1,13 +1,26 @@
-# bbs.casdu.cn 论坛爬虫 — 实现计划（修订版）
+# bbs.casdu.cn 论坛爬虫 — 实现计划
 
-## Context
+## 项目概述
 
 为山东大学自行车协会论坛（bbs.casdu.cn）编写全量爬虫，将帖子数据抓取、分类、标签化后本地存储，支持后续增量更新。输出到 `D:\ziYuan\github\casdu`。
 
 **核心约束**：
-- 仅抓取公开可见的论坛页面（archiver + forum.php），不访问后台/数据库
+- 仅抓取公开可见的论坛页面（forumdisplay.php + archiver + forum.php），不访问后台/数据库
 - 仅记录用户名等基本公开信息，不提取真实姓名/手机号/邮箱等隐私数据
 - 区分置顶帖与普通帖，全局置顶帖不重复索引
+
+**下游场景**：爬取数据的最终用途是作为 AI 问答智能体的知识库（论坛数据 → 检索 → 生成回答）。
+
+本项目分三个阶段推进：
+- **Phase 1: 爬虫脚本**（当前重点）— 完整抓取全量帖子数据，在减小服务器压力的前提下保证爬取效率
+- **Phase 2: 数据库与检索**（规划中）— 构建支持中文全文搜索的检索引擎
+- **Phase 3: AI 问答与权重**（规划中）— 排序加权与查询理解，提升 AI 问答质量
+
+---
+
+# Phase 1: 爬虫脚本
+
+> 目标：完整抓取 bbs.casdu.cn 全量帖子数据，选用 Archiver 入口（纯文本、低负载），单线程 + 随机间隔控制服务器压力，checkpoint 支持断点恢复。
 
 ---
 
@@ -30,7 +43,8 @@
 | 登录机制 | Discuz! X3.2 登录需 formhash CSRF token，简单 POST 会返回 System Error | 新发现（已降级为匿名模式） |
 | Archiver 标签 | 作者块为 `<p class="author">` 非 `<div>`（Discuz! X3.2 标准） | 新发现（已修复） |
 | 版块链接去重 | 每个版块有图标链接（无文字）+ 文字链接，需先过滤空 title 再去重 | 新发现（已修复） |
-| fid=152 实测 | 8 主题 135 帖，16s 完成，数据质量验证通过 | 测试通过 |
+| fid=152 实测 | 8 主题 135 帖，19s 完成，精华/置顶/pid 字段验证通过 | 测试通过 |
+| forumdisplay 替代 archiver | Phase 2 每页 1 次请求（减半），获取 digest/sticky/closed + author/replies | ✅ 已验证 |
 
 ---
 
@@ -38,7 +52,7 @@
 
 ### 1. 仅抓取公开信息
 
-- 所有数据来源仅为 bbs.casdu.cn **公开可访问**的页面（`archiver/` 纯文本归档）
+- 所有数据来源仅为 bbs.casdu.cn **公开可访问**的页面（`forumdisplay.php` + `archiver/` + `forum.php`）
 - **不访问**论坛后台、数据库、管理界面、或任何需登录才能查看的页面
 - **不尝试** SQL 注入、密码爆破、越权访问等任何攻击性行为
 
@@ -62,50 +76,124 @@
 
 ---
 
-## 置顶帖与普通帖区分
+## 爬取字段清单
 
-Discuz! 论坛中，全局置顶帖会出现在**所有版块**的列表顶部，版块置顶帖仅在该版块顶部显示。
+从 Archiver 页面可获取的字段及取舍决策：
 
-### 识别方式
+| 字段 | 爬取 | 说明 |
+|------|:--:|------|
+| 帖子标题 | ✅ | 必须 |
+| 作者用户名 | ✅ | 公开信息，去重用 |
+| 发帖时间 | ✅ | 增量爬取的时间锚点 |
+| 帖子正文（纯文本） | ✅ | 核心数据 |
+| 楼层号 | ✅ | 从页码 + 位置推算，零额外请求 |
+| 版块 ID / 名称 | ✅ | 版块列表页自带 |
+| 置顶标记 | ✅ | 从 forumdisplay.php 的 `pin_N.gif` 图标提取（0=普通, 1=版块, 2=分区, 3=全局） |
+| 精华标记 | ✅ | 从 forumdisplay.php 的 `digest_N.gif` 图标提取（0/1/2/3） |
+| 关闭标记 | ✅ | 从 forumdisplay.php 的 `folder_lock.gif` 检测（0/1） |
+| 互动元数据（评分/支持反对/收藏/点评） | ⚠️ 可选 | `--with-meta`，每条额外 1 次主站请求，全量耗时 +~2.5h |
+| 真实 pid（Discuz 楼层 ID） | ⚠️ 可选 | `--with-meta` 模式下自动提取并存到 JSONL + SQLite |
+| 作者 UID | ⚠️ 可选 | `--with-meta` 自动收集到 `known_uids.txt`，配合 `crawl_users.py` 批量抓取用户资料 |
+| 用户资料（积分/威望/用户组/注册时间） | ⚠️ 可选 | 需先 `--with-meta` 爬取，再 `python scripts/crawl_users.py`，零额外请求 |
+| 图片 URL | ❌ | Archiver 不提供 |
 
-Archiver 版块列表页中，置顶帖和普通帖都在同一 `<li>` 列表中，但主站 `forumdisplay` 页可通过 CSS 类名区分：
-- `class="icn_pt"` → 全局置顶
-- `class="icn_pt topic"` → 版块置顶
-- 无特殊 class → 普通帖
+> **数据来源策略**：Phase 2 使用 `forumdisplay.php` 收集线程列表（含精华/置顶/关闭标记），Phase 3 使用 `archiver/` 获取帖子正文（轻量、低负载）。`--with-meta` 模式下额外请求 `forum.php?mod=viewthread` 获取互动数据。
 
-### 处理策略
+---
 
-由于我们使用 archiver 入口（无 CSS 类名），采用以下策略：
+## 置顶、精华、关闭标记
 
-1. **全局置顶帖检测**：同一 tid 在 ≥3 个不同 fid 版块列表中出现 → 标记为全局置顶
-2. **版块置顶帖检测**：tid 仅在 1 个版块中出现，但在 `forumdisplay` 中位于"置顶分隔线"之上 → 标记为版块置顶
-3. **存储标记**：在 `threads` 表中增加 `sticky` 字段：
-   - `0` = 普通帖
-   - `1` = 版块置顶
-   - `2` = 全局置顶
-4. **索引时去重**：全局置顶帖在每个版块只保留首次出现的版块归属，后续版块中出现的同一个 tid 直接跳过
+Discuz! 论坛中，管理员可对帖子进行整理操作：置顶（版块/分区/全局）、精华（1/2/3 级）、高亮、关闭、分类等。
+
+### 识别方式（forumdisplay.php）
+
+Phase 2 直接使用 `forumdisplay.php`（非 archiver）收集线程列表，从 HTML 中提取：
+
+- **置顶等级（sticky）**：`<tbody id="stickthread_TID">` + 图标 `pin_1.gif`（版块） / `pin_2.gif`（分区） / `pin_3.gif`（全局）
+- **精华等级（digest）**：图标 `digest_1.gif` / `digest_2.gif` / `digest_3.gif`
+- **关闭状态（closed）**：图标 `folder_lock.gif` 或 `title="关闭的主题"`
 
 ### 实现位置
 
-- `utils.py` 中增加 `is_sticky_thread(html, tid)` 函数（解析主站 `forumdisplay` 页）
-- `scraper.py` Phase 2（收集线程列表）中，记录 `(tid, fid, title, is_sticky)` 四元组
-- `storage.py` 的 `threads` 表中增加 `sticky INTEGER DEFAULT 0` 字段
+- `utils.py` → `parse_forumdisplay_page()` 解析 tbody 块，返回 `{tid: {title, digest, sticky, closed, author, replies, post_time}}`
+- `scraper.py` Phase 2 → `make_forumdisplay_url()` + `parse_forumdisplay_max_page()` 替代 archiver
+- `storage.py` → `threads` 表中 `digest` / `sticky` / `closed` 三列（均为 `INTEGER DEFAULT 0`）
+
+---
+
+## Phase 1 补充项
+
+以下两项为 Phase 1 主体完工后追加的功能增强，均已实现并验证。
+
+### 补充 A：真实 pid 存储 + UID 自动收集
+
+**背景**：Discuz 论坛每层楼有全局唯一的帖子 ID（pid，如 `pid=164204`），嵌在主站 `viewthread` 页面 HTML 中（`id="pidXXXXXX"`）。`parse_thread_meta()` 可从 HTML block ID 提取该值，但此前仅用于楼层位置匹配，匹配后即丢弃，未存入 JSONL/DB。同时，作者 UID 也存在于主站页面的 `home.php?mod=space&uid=XXXXX` 链接中，此前只在 meta 的评分/点评者中附带收集，覆盖率仅 ~33%。
+
+**改动**：
+
+| 文件 | 改动 |
+|------|------|
+| `utils.py` | `parse_thread_meta()` 返回 dict 中已含 `pid` 和 `author_uid`（先于本次补充项完成） |
+| `storage.py` | `posts` 表新增 `real_pid INTEGER` 列 + 迁移 + `insert_post()` 写入 |
+| `scraper.py` | `crawl_full()` 中 `record["real_pid"] = matched.get("pid")`；遍历中收集所有 UID（作者+评分+点评）到 `all_uids` set，完成后写入 `data/known_uids.txt` |
+| `scraper.py` | `crawl_incremental()` 同步支持（此前增量模式完全不处理 `--with-meta`） |
+| `crawl_users.py` | 新增 `collect_known_uids_from_file()` 从 `known_uids.txt` 读取 UID 集合（此前已实现，本次确认可用） |
+
+**效果**：
+- JSONL 每条记录在 `--with-meta` 模式下带 `"real_pid": 164204`（Discuz 原生 ID）
+- SQLite `posts.real_pid` 列：110/110 帖全填充（fid=152 测试）
+- 作者 UID 覆盖率：从 33% → 100%（fid=152: 72/72 作者有 author_uid）
+- `known_uids.txt`：85 个 UID（含作者、评分者、点评者），供 `crawl_users.py` 消费
+
+### 补充 B：论坛管理标记（精华/置顶/关闭）
+
+**背景**：管理员可对帖子进行"升降|置顶|高亮|精华|图章|图标|关闭|移动|分类|复制|合并|分割|修复|警告|屏蔽|标签"等整理操作。其中精华（digest）、置顶（sticky）、关闭（closed）三类标记在 `forumdisplay.php` 版块列表页中有对应的图标（`digest_N.gif` / `pin_N.gif` / `folder_lock.gif`），可零额外请求提取。
+
+**改动**：
+
+| 文件 | 改动 |
+|------|------|
+| `utils.py` | 新增 `parse_forumdisplay_page()` — 解析 `<tbody id="stickthread_|normalthread_">` 块，提取 `{tid: {title, digest, sticky, closed, author, replies, post_time}}` |
+| `utils.py` | 新增 `parse_forumdisplay_max_page()` — 从分页链接提取最大页码 |
+| `utils.py` | 新增 `make_forumdisplay_url()` — 生成 forumdisplay URL |
+| `scraper.py` | Phase 2 从 archiver 改为 forumdisplay.php（每页 1 次请求替代原 2 次，且数据更丰富） |
+| `scraper.py` | Phase 3 解包新增 `digest, sticky, closed`，写入 JSONL record + `upsert_thread()` |
+| `scraper.py` | `crawl_incremental()` 同步更新 |
+| `storage.py` | `threads` 表新增 `digest`, `sticky`, `closed` 列 + 迁移 + `upsert_thread()` 更新 |
+
+**效果**：
+- Phase 2 请求数减半（不再同时请求 archiver + forumdisplay），且修复了 archiver 对个别帖子 404 导致数据丢失的 bug
+- `sticky`：0=普通, 1=版块置顶, 2=分区置顶, 3=全局置顶（从 `pin_N.gif` 精确区分）
+- `digest`：0=普通, 1/2/3=精华等级（从 `digest_N.gif` 提取）
+- `closed`：0/1（从 `folder_lock.gif` 检测）
+- fid=2（活动专区）实测：12 置顶帖（均为全局 sticky=3）+ 9 精华帖（digest=1/3）
 
 ---
 
 ## 文件结构
 
 ```
-D:\ziYuan\github\casdu\
-├── scraper.py              # 主控：全量 + 增量流程
-├── config.py               # 38版块字典 + 标签词表 + 速率常量
-├── utils.py                # HTTP请求、GBK容错解码、HTML清洗、页面解析
-├── classifier.py           # 自动分类标签引擎
-├── storage.py              # JSONL + SQLite + checkpoint
-├── data/
-│   ├── threads.jsonl       # 所有帖子（每行 = 一个 post）
-│   ├── index.db            # SQLite（threads + posts 双表 + FTS5）
-│   └── checkpoint.json     # 增量断点（每版块完成后更新）
+casdu-crawl/
+├── casdu_crawl/
+│   ├── __init__.py              # 包入口
+│   ├── config.py                # 配置：38 版块字典 + 7 类标签词表 + 速率常量
+│   ├── scraper.py               # 主控：全量 + 增量爬取流程
+│   ├── utils.py                 # HTTP、GBK 解码、forumdisplay/archiver 解析、元数据提取
+│   ├── classifier.py            # 自动分类标签引擎
+│   └── storage.py               # JSONL 写入 + SQLite（FTS5）+ Checkpoint
+├── scripts/
+│   ├── run_scraper.py           # 爬虫 CLI 入口
+│   ├── run_demo.py              # Demo 抽样 CLI 入口
+│   └── crawl_users.py           # 用户信息采集 CLI
+├── docs/
+│   └── CODE-GENERATE-PLAN.md    # 本文件
+├── data/                        # 爬取产出（运行后生成）
+│   ├── threads.jsonl            # 所有楼层，每行一条 JSON
+│   ├── index.db                 # SQLite（threads + posts + fts_posts）
+│   ├── checkpoint.json          # 断点记录
+│   ├── known_uids.txt           # UID 集合（--with-meta 自动生成）
+│   └── users.jsonl              # 用户资料（运行 crawl_users.py 生成）
+├── requirements.txt
 └── README.md
 ```
 
@@ -184,9 +272,12 @@ POST member.php?mod=logging&action=login&loginsubmit=yes
 
 - **`discover_boards(session)`** → 从 `forum.php` 首页抓取完整版块列表 `[(fid, name), ...]`
 
-- **`parse_board_page(html)`** → 从 archiver 版块页提取 `[(tid, title), ...]`
-  - Regex: `<li><a href="?tid-(\d+).html">(.*?)</a>`
-  - 提取页导航最大页码
+- **`parse_board_page(html)`** → 从 archiver 版块页提取 `[(tid, title), ...]`（demo 脚本仍在使用）
+
+- **`parse_forumdisplay_page(html)`** → 从 forumdisplay.php 版块列表页提取 `{tid: {title, digest, sticky, closed, author, replies, post_time}}`
+  - 解析 `<tbody id="stickthread_|normalthread_">` 块
+  - 从 `pin_N.gif` 提取置顶等级（1/2/3），从 `digest_N.gif` 提取精华等级
+  - **替代 archiver 版块页**作为 Phase 2 的数据源（一次请求获取更丰富的元数据）
 
 - **`parse_thread_posts(html)`** → 从 archiver 帖子页提取 `[{author, time, content}, ...]`
   - 以 `<p class="author">`（或 `<div class="author">`）为边界切分，通用 pattern: `<\w+\s+class="author">`
@@ -220,15 +311,15 @@ POST member.php?mod=logging&action=login&loginsubmit=yes
 {"tid":14559,"fid":2,"board":"活动专区","title":"2026春黄巢拉练总结帖",
  "author":"筺橙汁","floor":1,"post_time":"2026-04-16 11:54:21",
  "content":"纯文本正文...","tags":["拉练","黄巢","2026春"],
- "sticky":0,
+ "digest":0,"sticky":0,"closed":0,"real_pid":133322,
  ...}
 ```
 
 **index.db** — SQLite 四张表：
-- `threads(tid INT, fid INT, title TEXT, first_author TEXT, post_count INT, sticky INT DEFAULT 0, tags TEXT, ...)`
-- `posts(pid INT PK, tid INT, author TEXT, floor INT, post_time TEXT, content TEXT)`
+- `threads(tid INT, fid INT, title TEXT, first_author TEXT, post_count INT, digest INT DEFAULT 0, sticky INT DEFAULT 0, closed INT DEFAULT 0, tags TEXT, ...)`
+- `posts(pid INT PK AUTOINCREMENT, real_pid INT, tid INT, author TEXT, floor INT, post_time TEXT, content TEXT)`
 - `fts_posts` — FTS5 全文索引虚拟表
-- `sticky` 字段：`0`=普通帖, `1`=版块置顶, `2`=全局置顶
+- `digest`：精华等级 `0`/`1`/`2`/`3`；`sticky`：`0`=普通, `1`=版块, `2`=分区, `3`=全局；`closed`：`0`/`1`
 
 **checkpoint.json** — 断点恢复：
 ```json
@@ -247,15 +338,13 @@ POST member.php?mod=logging&action=login&loginsubmit=yes
 全量模式 (--full)
   1. discover_boards() → 38个版块
   2. for each board:
-     a. 爬 archiver 版块首页，获取总页数
+     a. 爬 forumdisplay.php 版块首页，获取总页数 + 线程列表
      b. for page in 1..max_page:
-        - 爬 ?fid-X.html&page=N
-        - 解析线程列表 → 存入 (fid, tid, title, sticky) 四元组
-        - 同一 tid 在 ≥3 个版块出现 → 标记 sticky=2（全局置顶），仅首个版块保留
-        - 仅在 1 个版块 + 列表前部 → 可选 sticky=1（版块置顶，需主站验证 icn_pt）
+        - 爬 forum.php?mod=forumdisplay&fid=X&page=N
+        - 解析线程列表 + 精华/置顶/关闭标记 → 存入 (tid, fid, title, board, digest, sticky, closed) 元组
      c. 更新 checkpoint（版块完成标记）
   3. for each tid:
-     a. 爬 ?tid-X.html，获取总页数
+     a. 爬 ?tid-X.html (archiver)，获取总页数
      b. for page in 1..max_page:
         - 爬 ?tid-X.html&page=N
         - 解析 posts → classify → 写 JSONL + DB
@@ -305,20 +394,159 @@ POST member.php?mod=logging&action=login&loginsubmit=yes
 3. 手动对比已知帖子（如 tid=14559）的 JSONL 输出
 4. 全量后跑增量 → 确认增量数 = 0
 5. 隐私审查：grep JSONL 输出确认不含手机号/邮箱/身份证号等结构化隐私字段
-6. 置顶帖检查：确认全局置顶帖（如"论坛使用指南"）未被重复索引
+6. 置顶帖检查：确认全局置顶帖 sticky=3，版块置顶 sticky=1（从 forumdisplay.php `pin_N.gif` 精确检测）
+7. 精华帖检查：`SELECT tid, digest FROM threads WHERE digest>0` — fid=2 检出 9 个精华帖 ✅ 已通过
+8. 真实 pid 检查：`SELECT COUNT(*) FROM posts WHERE real_pid IS NOT NULL` — fid=152: 110/110 ✅ 已通过
+9. UID 收集检查：`wc -l data/known_uids.txt` — fid=152: 85 个 UID ✅ 已通过
 
 ---
 
 ## 依赖
 
 - Python 3.8+, `requests`, 标准库（`json, sqlite3, time, random, argparse, re, pathlib, logging, urllib`）
-- 不用 beautifulsoup4 — archiver HTML 足够简单，regex 完全胜任
+- 不用 beautifulsoup4 — archiver 和 forumdisplay HTML 足够简单，regex 完全胜任
 
 ---
 
 ## 设计来源
 
 标签引擎的字典匹配 + 正则提取模式参考了 chexie-knowledge 的 `build_entities.py`；`normalize_text()` 清洗逻辑和 `split_text()` 分块逻辑也复用自同一项目。
+
+---
+
+## 范围边界（本阶段明确不做）
+
+| 不做 | 原因 |
+|------|------|
+| 多线程并发爬取 | 1.2h 全量可接受，无需增加复杂度 |
+| 代理池 / 速度档位 | 无反爬压力 |
+| 图片 URL 抓取 | Archiver 不提供 |
+
+---
+
+## Phase 1 补充项
+
+以下为 Phase 1 爬虫的后续优化方向，按优先级排列。
+
+### ✅ 已完成
+
+| 项 | 说明 | 涉及文件 |
+|----|------|---------|
+| 作者 UID 采集 | `--with-meta` 模式从 viewthread 页面自动提取作者 UID，与评分者/点评者 UID 合并写入 `data/known_uids.txt`（排序去重） | `utils.py:459` `scraper.py:138,305-326,382-387` |
+| 用户信息爬取 | 独立脚本 `scripts/crawl_users.py`，读取 `known_uids.txt`，批量抓取 `home.php?mod=space&uid=X&do=profile` 公开资料（积分/威望/用户组/注册时间/在线时间等 17 个字段），输出 `data/users.jsonl` | `scripts/crawl_users.py` |
+
+### 🔲 待实施
+
+| 项 | 说明 | 数据来源 | 额外请求 |
+|----|------|---------|:--:|
+| 真实 pid | 当前使用自增 ID 替代真实 pid。viewthread 页面已包含 `id="pidXXXXX"`，`parse_thread_meta()` 已提取但未存入 post 表 | viewthread (`--with-meta`) | 无 |
+| 精华标记 | 版块列表页（forumdisplay.php）有精华图标 CSS 类。在 Phase 2 收集线程列表时同步解析 | forumdisplay.php | 无 |
+| 回复数 / 查看数 | 同一页可见：`查看: 402 | 回复: 3`。可直接补入 threads 表 | forumdisplay.php | 无 |
+| 编辑记录 | 帖子页底部 "本帖最后由 XXX 于 YYYY-MM-DD HH:MM 编辑"，与 `--with-meta` 同源 | viewthread (`--with-meta`) | 无 |
+| 版块描述 / 版主 | 版块列表页顶部有版块简介和版主名，可在 Phase 2 收集线程时同步抓取 | forumdisplay.php | 无 |
+| 用户 UID 补全 | 存量数据中 599 位作者（66.5%）无 UID。下次 `--full --with-meta` 可自然补充；存量数据需用独立补采脚本 | viewthread | 805 次 (~30min) |
+
+> 以上待实施项均**零额外请求**（数据源已在现有爬取流程中被请求），只需追加解析逻辑。
+
+---
+
+# Phase 2: 数据库与检索
+
+> 目标：在 Phase 1 获取的数据基础上，构建支持中文全文搜索的检索引擎。检索精度直接影响下游 AI 问答质量。
+>
+> 状态：**规划中**，基线测量已完成（`baseline_runner.py`），具体检索方案待 Phase 1 完成后启动。
+
+---
+
+## 检索方案选型
+
+**现状问题**：SQLite FTS5 的 `unicode61` 分词器对中文不可用——基线测量（512 条查询）表明 recall@20 = 0.78%。连续 CJK 字符被当作单一 token，只有中文词偶然被 ASCII 分隔时才能命中。当前系统如果已接入 AI 问答，用户绝大多数查询返回空结果。
+
+**方案对比**（~1 万帖、纯 Python 栈）：
+
+| 方案 | 分词 | 召回质量 | 部署成本 |
+|------|:---:|:---:|------|
+| **Whoosh + jieba**（推荐） | jieba | ⭐⭐⭐⭐ 86.91% | 纯 Python，`pip install whoosh`，增量索引 |
+| SQLite FTS5 + jieba 预处理 | 写入侧分词 | ⭐⭐⭐⭐ | 保持 SQLite 架构，但真正注册分词器需 C 扩展 |
+| DuckDB FTS | 内置 CJK | ⭐⭐⭐½ | `pip install duckdb`，单文件，备选 |
+| `rank_bm25` + jieba（裸算） | jieba | ⭐⭐⭐⭐ 86.91% | 无增量索引，每次全量重算，仅适合基线测量 |
+
+Meilisearch / ES+IK / Tantivy 均需外部服务或编译依赖，与本项目规模不匹配。
+
+**结论**：Whoosh + jieba 是当前最优解——`baseline_runner.py` 已用 `rank_bm25` + jieba 验证过同类方案（recall@20 = 86.91%），Whoosh 是其工程化版本（增量索引、磁盘持久化、BM25 评分 + 查询语法），无需推翻现有架构。
+
+---
+
+## 优化路线图
+
+基线测量后的数据驱动优先级：
+
+| 优先级 | 事项 | 触发数据 |
+|--------|------|---------|
+| **P0** | Whoosh + jieba 替换 FTS5 | FTS5 recall@20 = 0.78%，基本不可用 |
+| **P0** | 过滤空内容帖 | 占 BM25 剩余失败 75% |
+| P1 | 相邻楼层上下文合并 | 短回复缺乏区分度 |
+| P1 | 查询改写词典（同义词 + 上位词） | 17.9% 失败为查询失配 |
+| P2 | 楼层位置权重（首帖加权） | 首帖信息密度最高 |
+
+向量检索暂不引入——BM25 在当前数据量上 recall@20 已达 86.91%，embedding 模型的增量与成本不匹配。
+
+---
+
+## 范围边界（本阶段明确不做）
+
+| 不做 | 原因 |
+|------|------|
+| Flask Web 离线浏览 | AI 问答不需要浏览器 |
+| 词云 / 热力图 / 情感分析等分析模块 | AI 实时推理即可，无需预计算 |
+| 帖子引用链 pid 解析 | Archiver HTML 的 blockquote 不含 pid，技术上不可行 |
+| 向量检索（embedding） | BM25 召回已足够，增量与成本不匹配 |
+
+---
+
+# Phase 3: AI 问答与权重
+
+> 目标：在检索基础上引入排序加权和查询理解，提升 AI 问答质量。
+>
+> 状态：**规划中**，具体方案待 Phase 2 检索管线稳定后设计。
+
+---
+
+## 版块权威度
+
+用于检索排序加权（数据驱动，待 Phase 2 验证）：
+- 技术类（关于单车、路线攻略）和远征/支教/实践版块 > 活动专区/求助 > 站务 > 闲聊/感悟
+
+## 话题分类体系
+
+按车协实际活动体系组织：
+- 暑期活动（远征/行疆/小队）、冬游、日常拉练、修车技巧、装备推荐、安全事故、纳新流程、内部管理
+
+## 查询改写与扩展
+
+- 同义词映射（50 条领域同义词，已储备于 `scripts/synonym_map.py`）
+- 上位词映射（80+ 条领域上位词，已储备于 `scripts/hypernym_map.py`）
+
+## 内容质量信号
+
+- 文本长度、结构化程度（替代不可获取的 view_count）
+
+## 安全事故类查询
+
+"答错后果"由 Agent 层面的自检和权威加权保证，数据库只管准确检索。
+
+---
+
+## 范围边界（本阶段明确不做）
+
+| 不做 | 原因 |
+|------|------|
+| 作者权威评分系统 | 需要引用图 + 领域分类 + 评分模型，量级过大（从 UID 到权威评分中间是一篇硕士论文） |
+| 用户 UID / 积分 / 用户组采集 | Phase 1 不爬；Phase 2 按需补充仅用于去重过滤，不追求权威评分 |
+
+---
+
+# 附录
 
 ## 附录：fid=152 首次爬取调试记录
 

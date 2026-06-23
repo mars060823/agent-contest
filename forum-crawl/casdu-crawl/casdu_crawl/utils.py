@@ -5,6 +5,7 @@ HTTP 请求、GBK 容错解码、HTML 清洗、页面解析
 """
 
 import re
+import sys
 import time
 import random
 import logging
@@ -12,6 +13,32 @@ from typing import Optional
 from urllib.parse import urljoin
 
 import requests
+
+
+# ============================================================================
+# 日志工具
+# ============================================================================
+
+def setup_console_utf8():
+    """创建已打补丁的控制台 StreamHandler，处理 Windows GBK 终端编码错误。
+
+    返回的 handler 在 write() 遇到 UnicodeEncodeError 时会自动降级为 ASCII 替代字符，
+    避免因 emoji / CJK 字符导致日志中断。
+
+    Returns:
+        logging.StreamHandler: 可直接传给 basicConfig(handlers=[...]) 的 handler
+    """
+    handler = logging.StreamHandler(sys.stdout)
+    _orig_write = handler.stream.write
+
+    def _safe_write(msg):
+        try:
+            _orig_write(msg)
+        except UnicodeEncodeError:
+            _orig_write(msg.encode("ascii", errors="replace").decode("ascii"))
+
+    handler.stream.write = _safe_write
+    return handler
 
 from casdu_crawl.config import (
     MIN_DELAY, MAX_DELAY, RETRY_DELAY, MAX_RETRIES, TIMEOUT,
@@ -85,12 +112,14 @@ def fetch(url: str, session: requests.Session, force_no_delay: bool = False) -> 
 
     - 每次调用后自动 sleep(random.uniform(MIN_DELAY, MAX_DELAY))
     - 遇 429/5xx → 退避重试（最多 MAX_RETRIES 次）
-    - force_no_delay=True 时不 sleep（用于连续调用同一个版块的翻页）
+    - force_no_delay=True 时跳过请求后延迟（用于同一资源首页：此前的 Phase 切换或版块
+      遍历已有足够自然间隔，无需额外人工延迟）
 
     Args:
         url: 目标 URL
         session: requests.Session 实例
-        force_no_delay: 是否跳过请求后延迟
+        force_no_delay: 跳过请求后的人为延迟。同一资源的后续翻页请求不应设置此项（应保持
+            正常延迟），首页请求可设置以利用流程中的自然间隔。
 
     Returns:
         解码后的 HTML 文本
@@ -343,6 +372,28 @@ def parse_thread_max_page(html: str) -> int:
 
 
 # ============================================================================
+# 回复引用提取
+# ============================================================================
+
+def parse_reply_to(content: str) -> tuple:
+    """从 archiver 正文开头提取楼层回复引用。
+
+    Discuz archiver 中，点击"回复"按钮产生的帖子会在正文开头插入
+    "回复 N# username" 标记（如 "回复 37# goward12"）。
+
+    Args:
+        content: 清洗后的帖子正文
+
+    Returns:
+        (reply_to_floor: int | None, reply_to_user: str | None)
+    """
+    m = re.match(r'回复\s*(\d+)\#\s*(\S+)', content)
+    if m:
+        return int(m.group(1)), m.group(2)
+    return None, None
+
+
+# ============================================================================
 # 文本清洗
 # ============================================================================
 
@@ -441,7 +492,7 @@ def parse_thread_meta(html: str) -> list[dict]:
         html: 主站帖子页 HTML（GBK 已解码为 Unicode）
 
     Returns:
-        [{pid, rating_count, rating_coins, rating_details,
+        [{pid, author_uid, rating_count, rating_coins, rating_details,
           recommend_add, recommend_subtract, favorite_count,
           comment_count, comments}, ...]
     """
@@ -457,6 +508,14 @@ def parse_thread_meta(html: str) -> list[dict]:
     for pid_str, block in post_blocks:
         pid = int(pid_str)
         meta: dict = {"pid": pid}
+
+        # --- 帖子作者 UID ---
+        # 每个 post block 中第一个 home.php?mod=space 链接即为作者
+        author_uid_m = re.search(
+            r'home\.php\?mod=space(?:&amp;|&)uid=(\d+)',
+            block[:3000],
+        )
+        meta["author_uid"] = int(author_uid_m.group(1)) if author_uid_m else None
 
         # --- 评分 ---
         rater_m = re.search(
@@ -558,6 +617,132 @@ def make_thread_url(tid: int, page: int = 1) -> str:
 def thread_web_url(tid: int) -> str:
     """生成主站帖子链接（用于引用）。"""
     return f"{BASE_URL}/forum.php?mod=viewthread&tid={tid}"
+
+
+def make_forumdisplay_url(fid: int, page: int = 1) -> str:
+    """生成主站 forumdisplay 版块列表页 URL。"""
+    if page <= 1:
+        return f"{BASE_URL}/forum.php?mod=forumdisplay&fid={fid}"
+    return f"{BASE_URL}/forum.php?mod=forumdisplay&fid={fid}&page={page}"
+
+
+def parse_forumdisplay_page(html: str) -> dict[int, dict]:
+    """从 forumdisplay.php 版块列表页提取每个主题帖的元数据。
+
+    解析 Discuz! X3.2 主站版块列表页，获取比 archiver 更丰富的帖子状态：
+      - 精华等级（digest 1/2/3）
+      - 置顶等级（0=普通, 1=版块, 2=分区, 3=全局）
+      - 关闭状态（0/1）
+      - 作者、回复数、发帖时间（archiver 版块页不提供）
+
+    Returns:
+        {tid: {"title": str, "digest": int, "sticky": int, "closed": int,
+               "author": str, "replies": int, "post_time": str}, ...}
+    """
+    # 匹配每个帖子的 tbody 块
+    # 注意：此正则依赖 .*?</tbody> 的非贪婪匹配来正确切分每个 tbody。
+    # Discuz! X3.2 的 HTML 确保每个 tbody 都有闭合标签且不嵌套，
+    # 因此 re.DOTALL + 非贪婪是安全的。如果目标站点升级模板，
+    # 需验证 HTML 结构是否仍满足此假设。
+    tbody_pattern = re.compile(
+        r'<tbody\s+id="(stickthread_|normalthread_)(\d+)"[^>]*>(.*?)</tbody>',
+        re.DOTALL,
+    )
+
+    result: dict[int, dict] = {}
+    for prefix, tid_str, block in tbody_pattern.findall(html):
+        tid = int(tid_str)
+
+        # ── 标题 ──
+        title_m = re.search(
+            r'<a\s+[^>]*class="[^"]*xst[^"]*"[^>]*>(.*?)</a>',
+            block,
+        )
+        title = re.sub(r'<[^>]+>', '', title_m.group(1)).strip() if title_m else ""
+
+        if not title:
+            continue  # 跳过无效行
+
+        # ── 置顶等级 ──
+        # pin_1.gif → 版块置顶, pin_2.gif → 分区置顶, pin_3.gif → 全局置顶
+        sticky = 0
+        if prefix == "stickthread_":
+            pin_m = re.search(r'pin_(\d)\.(?:gif|png)', block)
+            sticky = int(pin_m.group(1)) if pin_m else 1  # 默认版块置顶
+
+        # ── 精华等级 ──
+        digest_m = re.search(r'digest[_-](\d)\.(?:gif|png)', block)
+        digest = int(digest_m.group(1)) if digest_m else 0
+
+        # ── 关闭状态 ──
+        closed = 1 if ("folder_lock" in block or "关闭的主题" in block) else 0
+
+        # ── 作者 ──
+        author_m = re.search(r'<cite><a[^>]*>([^<]+)</a></cite>', block)
+        author = author_m.group(1).strip() if author_m else ""
+
+        # ── 回复数 ──
+        replies_m = re.search(
+            r'<td\s+class="num"[^>]*>.*?<a[^>]*>(\d+)</a>',
+            block, re.DOTALL,
+        )
+        replies = int(replies_m.group(1)) if replies_m else 0
+
+        # ── 发帖时间 ──
+        time_m = re.search(r'<em>\s*(?:<span[^>]*>)?([^<]{6,15})(?:</span>)?\s*</em>', block)
+        post_time = time_m.group(1).strip() if time_m else ""
+
+        result[tid] = {
+            "title": title,
+            "digest": digest,
+            "sticky": sticky,
+            "closed": closed,
+            "author": author,
+            "replies": replies,
+            "post_time": post_time,
+        }
+
+    return result
+
+
+def parse_forumdisplay_max_page(html: str) -> int:
+    """从 forumdisplay.php 版块列表页提取最大页码。
+
+    Discuz! 分页格式：
+      <a href="forum.php?mod=forumdisplay&fid=X&page=35">35</a>
+
+    Returns:
+        最大页码（至少为 1）
+    """
+    page_links = re.findall(
+        r'forumdisplay[^"]*page=(\d+)',
+        html,
+    )
+    if not page_links:
+        return 1
+    return max(int(p) for p in page_links)
+
+
+def normalize_post_time(raw: str) -> str:
+    """将论坛 archiver 显示时间转为 ISO-8601 格式（UTC+8）。
+
+    archiver 实际格式为 "YYYY-M-D HH:MM:SS"（月日可能无前导零），
+    如 "2025-10-12 15:04:38" 或 "2018-3-3 12:05:51"。
+
+    Args:
+        raw: 论坛时间字符串
+
+    Returns:
+        ISO-8601 格式，如 "2025-10-12T15:04:38+08:00"。无法识别则返回原字符串。
+    """
+    if not raw:
+        return ""
+    # 匹配 "YYYY-M-D HH:MM:SS"（月日可为 1-2 位数字）
+    m = re.match(r"(\d{4})-(\d{1,2})-(\d{1,2})\s+(\d{2}:\d{2}:\d{2})", raw)
+    if m:
+        y, mo, d, t = m.group(1), m.group(2), m.group(3), m.group(4)
+        return f"{y}-{int(mo):02d}-{int(d):02d}T{t}+08:00"
+    return raw
 
 
 def format_duration(seconds: float) -> str:
